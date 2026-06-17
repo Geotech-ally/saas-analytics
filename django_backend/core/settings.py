@@ -23,8 +23,10 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    "django.contrib.sites",
 
     # Third-party
+
     "rest_framework",
     "rest_framework_simplejwt",
     "corsheaders",
@@ -153,6 +155,11 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3002")
 
 # Site URL (used by allauth)
 SITE_ID = int(os.getenv("DJANGO_SITE_ID", "1"))
+
+# Force social redirects to use HTTP locally (avoid HTTPS forcing).
+ACCOUNT_DEFAULT_HTTP_PROTOCOL = "http"
+
+
 
 # allauth config
 AUTHENTICATION_BACKENDS = (
