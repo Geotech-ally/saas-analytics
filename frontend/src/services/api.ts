@@ -64,12 +64,14 @@ function createClient(baseURL: string): AxiosInstance {
 }
 
 // ── Clients ────────────────────────────────────────────────────────────────
-const DJANGO_URL = (import.meta as any).env?.VITE_DJANGO_URL || "http://localhost:8000";
-const FASTAPI_URL = (import.meta as any).env?.VITE_FASTAPI_URL || "http://localhost:8001";
+const DJANGO_URL = "http://127.0.0.1:8000";
+const FASTAPI_URL = "http://127.0.0.1:8001";
+
 
 
 export const djangoAPI = createClient(DJANGO_URL);
 export const analyticsAPI = createClient(FASTAPI_URL);
+
 
 
 // ── Auth ───────────────────────────────────────────────────────────────────
@@ -80,10 +82,11 @@ export const authService = {
     return data;
   },
   socialTokenExchange: async () => {
-    const { data } = await djangoAPI.get("/api/v1/auth/social/token-exchange/");
+    const { data } = await djangoAPI.post("/api/v1/auth/social/token-exchange/");
     tokenStorage.set(data.access, data.refresh);
     return data;
   },
+
 
   register: async (payload: Record<string, unknown>) => {
     const { data } = await djangoAPI.post("/api/v1/auth/register/", payload);
