@@ -1,0 +1,1 @@
+NOTE: Logout blacklisting implementation may require correct BlacklistedToken fields for SimpleJWT version. Verify by running migrations and testing endpoint.

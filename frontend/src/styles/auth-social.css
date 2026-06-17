@@ -1,0 +1,56 @@
+/* Social auth UI (imported by globals via main bundle) */
+.auth-social {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 0 0 18px;
+}
+
+.auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  justify-content: center;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: lowercase;
+}
+
+.auth-divider::before,
+.auth-divider::after {
+  content: "";
+  height: 1px;
+  flex: 1;
+  background: rgba(38,51,68,0.9);
+  border-radius: 999px;
+}
+
+.btn-social {
+  width: 100%;
+  padding: 10px 16px;
+  border-radius: var(--radius-sm);
+  font-weight: 700;
+  font-size: 13px;
+  border: 1px solid rgba(38,51,68,0.9);
+  color: var(--text-primary);
+  background: var(--bg-elevated);
+  transition: transform 0.1s, background 0.15s, border-color 0.15s;
+}
+
+.btn-social:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: rgba(99,102,241,0.6);
+}
+
+.btn-social:active { transform: scale(0.99); }
+.btn-social:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.btn-social--google {
+  border-color: rgba(234, 179, 8, 0.35);
+}
+
+.btn-social--microsoft {
+  border-color: rgba(99, 102, 241, 0.35);
+}
+
