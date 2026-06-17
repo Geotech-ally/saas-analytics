@@ -28,15 +28,17 @@ jobs:
 
     env:
       DJANGO_SETTINGS_MODULE: core.settings
-      DJANGO_SECRET_KEY: ci-test-secret-key-not-for-production
+      DJANGO_SECRET_KEY: ci-test-fallback-secret-key-123
       DJANGO_DEBUG: "True"
       DJANGO_ALLOWED_HOSTS: "localhost 127.0.0.1"
       POSTGRES_DB: test_db
-      POSTGRES_USER: test_user
-      POSTGRES_PASSWORD: test_pass
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
       POSTGRES_HOST: localhost
-      INTERNAL_SERVICE_KEY: ci-internal-key
+      POSTGRES_PORT: 5432
+      INTERNAL_SERVICE_KEY: ci-test-service-token-123
       FASTAPI_BASE_URL: http://localhost:8001
+
 
     steps:
       - uses: actions/checkout@v4
@@ -90,7 +92,16 @@ jobs:
 
       - name: Run tests
         working-directory: fastapi_service
+        env:
+          DJANGO_SECRET_KEY: ci-test-fallback-secret-key-123
+          POSTGRES_DB: test_db
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
+          INTERNAL_SERVICE_KEY: ci-test-service-token-123
         run: pytest -v --tb=short
+
 
   # ── Frontend build ────────────────────────────────────────────────────
   frontend:
