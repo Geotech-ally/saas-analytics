@@ -1,10 +1,13 @@
 """
 Secure HTTP client for Django → FastAPI service communication.
-Uses the user's JWT so FastAPI can validate identity and permissions.
+Uses the user's JWT for identity and a short-lived internal JWT for
+service-to-service authentication.
 """
 import logging
+import time
 from typing import Any, Dict
 
+import jwt
 import requests
 from django.conf import settings
 from rest_framework_simplejwt.tokens import AccessToken
@@ -14,21 +17,33 @@ logger = logging.getLogger(__name__)
 FASTAPI_BASE_URL = getattr(settings, "FASTAPI_BASE_URL", "http://fastapi:8001")
 REQUEST_TIMEOUT = 10  # seconds
 
+SERVICE_TOKEN_LIFETIME = int(getattr(settings, "SERVICE_TOKEN_LIFETIME_SECONDS", "300"))
+
 
 class FastAPIClientError(Exception):
     pass
 
 
+def _make_service_token() -> str:
+    now = int(time.time())
+    payload = {
+        "service_name": "django-backend",
+        "iat": now,
+        "exp": now + SERVICE_TOKEN_LIFETIME,
+        "nbf": now,
+    }
+    return jwt.encode(payload, settings.FASTAPI_SERVICE_SECRET, algorithm="HS256")
+
+
 class FastAPIClient:
     def __init__(self, user):
         token = AccessToken.for_user(user)
-        # Embed org/role claims consumed by FastAPI middleware
         token["role"] = user.role
         token["org_id"] = str(user.organization_id) if user.organization_id else None
         self._headers = {
             "Authorization": f"Bearer {str(token)}",
             "Content-Type": "application/json",
-            "X-Service-Key": settings.INTERNAL_SERVICE_KEY,
+            "X-Service-Key": _make_service_token(),
         }
 
     def _get(self, path: str, params: Dict = None) -> Any:

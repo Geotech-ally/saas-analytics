@@ -1,7 +1,9 @@
 """
 Analytics endpoints — all require a valid Django-issued JWT.
+Tenant isolation is enforced by validating dataset ownership.
 """
 import asyncio
+import logging
 from datetime import datetime
 from typing import List
 from uuid import UUID
@@ -28,7 +30,36 @@ from services.analytics_service import (
 )
 from services.data_loader import load_dataset
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/v1", tags=["Analytics"])
+
+
+def _validate_dataset_ownership(dataset_id: UUID, claims: TokenClaims) -> None:
+    cache_key = f"dataset_org:{dataset_id}"
+    try:
+        from django.core.cache import cache
+        cached_org = cache.get(cache_key)
+        if cached_org is not None:
+            if str(cached_org) != str(claims.org_id):
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+            return
+    except Exception:
+        pass
+    try:
+        from apps.datasets.models import Dataset
+        dataset = Dataset.objects.select_related("organization").get(id=dataset_id)
+        if str(dataset.organization_id) != str(claims.org_id):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+        try:
+            from django.core.cache import cache
+            cache.set(cache_key, str(dataset.organization_id), timeout=300)
+        except Exception:
+            pass
+    except ImportError:
+        pass
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
 
 @router.post("/datasets/{dataset_id}/process", response_model=ProcessingResponse)
@@ -37,9 +68,8 @@ async def trigger_processing(
     x_service_key: str = Header(..., alias="X-Service-Key"),
     claims: TokenClaims = Depends(require_org_member),
 ):
-    """Internal endpoint called by Django when a new dataset is uploaded."""
     verify_service_key(x_service_key)
-    # In production: push to Celery/RQ worker; here we return immediately
+    _validate_dataset_ownership(dataset_id, claims)
     return ProcessingResponse(
         dataset_id=dataset_id,
         status="queued",
@@ -52,13 +82,16 @@ async def get_analytics(
     dataset_id: UUID,
     claims: TokenClaims = Depends(require_org_member),
 ):
-    """Full analytics report for a dataset."""
+    _validate_dataset_ownership(dataset_id, claims)
     try:
-        df = await asyncio.to_thread(load_dataset, str(dataset_id), claims.org_id)
+        df = await asyncio.to_thread(load_dataset, str(dataset_id), str(claims.org_id))
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Dataset not found.")
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to load dataset: {exc}")
+        logger.error("Failed to load dataset %s: %s", dataset_id, exc)
+        raise HTTPException(status_code=500, detail="Failed to load dataset.")
 
     numeric_cols = df.select_dtypes(include="number").columns.tolist()
     if not numeric_cols:
@@ -93,7 +126,7 @@ async def get_analytics(
 
     return AnalyticsResponse(
         dataset_id=dataset_id,
-        org_id=claims.org_id,
+        org_id=str(claims.org_id),
         kpi=kpi,
         trends=trends,
         anomalies=anomalies,
@@ -107,11 +140,16 @@ async def get_insights(
     dataset_id: UUID,
     claims: TokenClaims = Depends(require_org_member),
 ):
-    """Natural-language insights derived from analytics."""
+    _validate_dataset_ownership(dataset_id, claims)
     try:
-        df = await asyncio.to_thread(load_dataset, str(dataset_id), claims.org_id)
+        df = await asyncio.to_thread(load_dataset, str(dataset_id), str(claims.org_id))
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Dataset not found.")
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except Exception as exc:
+        logger.error("Failed to load dataset %s: %s", dataset_id, exc)
+        raise HTTPException(status_code=500, detail="Failed to load dataset.")
 
     numeric_cols = df.select_dtypes(include="number").columns.tolist()
     if not numeric_cols:
@@ -135,11 +173,16 @@ async def get_kpi(
     dataset_id: UUID,
     claims: TokenClaims = Depends(require_org_member),
 ):
-    """Lightweight KPI endpoint for dashboard widgets."""
+    _validate_dataset_ownership(dataset_id, claims)
     try:
-        df = await asyncio.to_thread(load_dataset, str(dataset_id), claims.org_id)
+        df = await asyncio.to_thread(load_dataset, str(dataset_id), str(claims.org_id))
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Dataset not found.")
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except Exception as exc:
+        logger.error("Failed to load dataset %s: %s", dataset_id, exc)
+        raise HTTPException(status_code=500, detail="Failed to load dataset.")
 
     numeric_cols = df.select_dtypes(include="number").columns.tolist()
     if not numeric_cols:

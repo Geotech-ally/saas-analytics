@@ -2,6 +2,8 @@ version: "3.9"
 
 x-django-env: &django-env
   DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY}
+  JWT_SIGNING_SECRET: ${JWT_SIGNING_SECRET}
+  FASTAPI_SERVICE_SECRET: ${FASTAPI_SERVICE_SECRET}
   DJANGO_DEBUG: "False"
   DJANGO_ALLOWED_HOSTS: "localhost 127.0.0.1 django"
   POSTGRES_DB: ${POSTGRES_DB}
@@ -11,14 +13,18 @@ x-django-env: &django-env
   FASTAPI_BASE_URL: http://fastapi:8001
   INTERNAL_SERVICE_KEY: ${INTERNAL_SERVICE_KEY}
   CORS_ALLOWED_ORIGINS: "http://localhost,http://frontend"
+  CELERY_BROKER_URL: redis://redis:6379/0
+  CELERY_RESULT_BACKEND: redis://redis:6379/0
+  SERVICE_TOKEN_LIFETIME_SECONDS: "300"
 
 x-fastapi-env: &fastapi-env
-  DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY}
+  JWT_SIGNING_SECRET: ${JWT_SIGNING_SECRET}
+  FASTAPI_SERVICE_SECRET: ${FASTAPI_SERVICE_SECRET}
   INTERNAL_SERVICE_KEY: ${INTERNAL_SERVICE_KEY}
   MEDIA_ROOT: /app/media
 
 services:
-  # ── PostgreSQL ────────────────────────────────────────────────────────
+  # ── PostgreSQL ────────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
@@ -36,7 +42,21 @@ services:
     networks:
       - backend
 
-  # ── Django ────────────────────────────────────────────────────────────
+  # ── Redis ─────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - backend
+
+  # ── Django ────────────────────────────────────────────────────
   django:
     build:
       context: ./django_backend
@@ -50,12 +70,15 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     networks:
       - backend
       - frontend
     command: >
       sh -c "python manage.py migrate --noinput &&
              python manage.py collectstatic --noinput &&
+             celery -A core worker --loglevel=info --concurrency=2 &
              gunicorn core.wsgi:application
                --bind 0.0.0.0:8000
                --workers 4
@@ -63,7 +86,7 @@ services:
                --threads 2
                --timeout 60"
 
-  # ── FastAPI ───────────────────────────────────────────────────────────
+  # ── FastAPI ───────────────────────────────────────────────────
   fastapi:
     build:
       context: ./fastapi_service
@@ -76,11 +99,28 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     networks:
       - backend
       - frontend
 
-  # ── React Frontend ────────────────────────────────────────────────────
+  # ── Celery Beat (periodic tasks) ─────────────────────────────
+  celery-beat:
+    build:
+      context: ./django_backend
+      dockerfile: ../docker/Dockerfile.django
+    restart: unless-stopped
+    environment:
+      <<: *django-env
+    depends_on:
+      - redis
+      - django
+    networks:
+      - backend
+    command: celery -A core beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+
+  # ── React Frontend ────────────────────────────────────────────────
   frontend:
     build:
       context: ./frontend
@@ -101,6 +141,7 @@ volumes:
   postgres_data:
   media_data:
   static_data:
+  redis_data:
 
 networks:
   backend:

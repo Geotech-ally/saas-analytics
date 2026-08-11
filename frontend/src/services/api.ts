@@ -77,7 +77,7 @@ export const analyticsAPI = createClient(FASTAPI_URL);
 // ── Auth ───────────────────────────────────────────────────────────────────
 export const authService = {
   login: async (email: string, password: string) => {
-    const { data } = await djangoAPI.post("/api/v1/auth/token/", { email, password });
+    const { data } = await djangoAPI.post("/api/v1/auth/login/", { email, password });
     tokenStorage.set(data.access, data.refresh);
     return data;
   },
@@ -89,7 +89,24 @@ export const authService = {
 
 
   register: async (payload: Record<string, unknown>) => {
-    const { data } = await djangoAPI.post("/api/v1/auth/register/", payload);
+    const res = await djangoAPI.post("/api/v1/auth/registration/", {
+      email: payload.email,
+      password1: payload.password,
+      password2: payload.password_confirm,
+      first_name: payload.first_name,
+      last_name: payload.last_name,
+      organization: payload.organization_id || null,
+    });
+    const data = res.data;
+    if (res.status >= 400) {
+      throw new Error(
+        data.email?.[0] ||
+        data.password1?.[0] ||
+        data.non_field_errors?.[0] ||
+        "Registration failed"
+      );
+    }
+    tokenStorage.set(data.access, data.refresh);
     return data;
   },
   forgotPassword: async (email: string) => {
