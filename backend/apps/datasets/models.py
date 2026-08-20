@@ -26,7 +26,7 @@ class Dataset(models.Model):
         FAILED = "failed", "Failed"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    organization = models.ForeignKey("organizations.Organization", on_delete=models.CASCADE, related_name="datasets", null=True, blank=True)
+    organization = models.ForeignKey("organizations.Organization", on_delete=models.CASCADE, related_name="datasets")
     uploaded_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,

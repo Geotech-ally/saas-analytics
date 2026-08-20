@@ -66,9 +66,7 @@ export default function App() {
         password_confirm: data.password_confirm,
         first_name: data.first_name,
         last_name: data.last_name,
-        // Omit organization_id when empty so backend can auto-create.
-        ...(data.organization_id?.trim() ? { organization_id: data.organization_id } : {}),
-      } as any);
+      });
 
 
       // After successful registration, log them in

@@ -4,13 +4,13 @@ Tenant isolation is enforced by validating dataset ownership.
 """
 import asyncio
 import logging
-from datetime import datetime
-from typing import List
+from datetime import datetime, timezone
+from typing import List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 
-from core.auth import get_current_user, require_org_member, verify_service_key
+from fastapi_service.core.auth import get_current_user, require_org_member, verify_service_key
 from schemas.analytics import (
     AnalyticsResponse,
     AnomalyReport,
@@ -57,7 +57,12 @@ def _validate_dataset_ownership(dataset_id: UUID, claims: TokenClaims) -> None:
         except Exception:
             pass
     except ImportError:
-        pass
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Dataset authorization service unavailable.",
+        )
+    except Dataset.DoesNotExist:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found.")
     except Exception:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
@@ -80,6 +85,7 @@ async def trigger_processing(
 @router.get("/analytics/{dataset_id}", response_model=AnalyticsResponse)
 async def get_analytics(
     dataset_id: UUID,
+    metric_column: Optional[str] = None,
     claims: TokenClaims = Depends(require_org_member),
 ):
     _validate_dataset_ownership(dataset_id, claims)
@@ -97,8 +103,17 @@ async def get_analytics(
     if not numeric_cols:
         raise HTTPException(status_code=422, detail="No numeric columns found for analysis.")
 
-    primary_col = numeric_cols[0]
+    if len(df) == 0:
+        raise HTTPException(status_code=422, detail="Dataset is empty.")
+
+    primary_col = metric_column if metric_column in numeric_cols else numeric_cols[0]
     values: List[float] = df[primary_col].dropna().tolist()
+
+    if not values:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Selected column '{primary_col}' contains no valid numeric values.",
+        )
 
     kpi = compute_kpis(values, dataset_id)
     trends = detect_trends(values, dataset_id)
@@ -131,13 +146,14 @@ async def get_analytics(
         trends=trends,
         anomalies=anomalies,
         column_stats=col_stats,
-        computed_at=datetime.utcnow(),
+        computed_at=datetime.now(timezone.utc),
     )
 
 
 @router.get("/analytics/{dataset_id}/insights", response_model=InsightsResponse)
 async def get_insights(
     dataset_id: UUID,
+    metric_column: Optional[str] = None,
     claims: TokenClaims = Depends(require_org_member),
 ):
     _validate_dataset_ownership(dataset_id, claims)
@@ -155,7 +171,18 @@ async def get_insights(
     if not numeric_cols:
         raise HTTPException(status_code=422, detail="No numeric columns found.")
 
-    values = df[numeric_cols[0]].dropna().tolist()
+    if len(df) == 0:
+        raise HTTPException(status_code=422, detail="Dataset is empty.")
+
+    primary_col = metric_column if metric_column in numeric_cols else numeric_cols[0]
+    values = df[primary_col].dropna().tolist()
+
+    if not values:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Selected column '{primary_col}' contains no valid numeric values.",
+        )
+
     kpi = compute_kpis(values, dataset_id)
     trends = detect_trends(values, dataset_id)
     anomalies = detect_anomalies(values, dataset_id)
@@ -164,13 +191,14 @@ async def get_insights(
     return InsightsResponse(
         dataset_id=dataset_id,
         insights=insight_items,
-        generated_at=datetime.utcnow(),
+        generated_at=datetime.now(timezone.utc),
     )
 
 
 @router.get("/analytics/{dataset_id}/kpi", response_model=KPISummary)
 async def get_kpi(
     dataset_id: UUID,
+    metric_column: Optional[str] = None,
     claims: TokenClaims = Depends(require_org_member),
 ):
     _validate_dataset_ownership(dataset_id, claims)
@@ -188,5 +216,16 @@ async def get_kpi(
     if not numeric_cols:
         raise HTTPException(status_code=422, detail="No numeric columns found.")
 
-    values = df[numeric_cols[0]].dropna().tolist()
+    if len(df) == 0:
+        raise HTTPException(status_code=422, detail="Dataset is empty.")
+
+    primary_col = metric_column if metric_column in numeric_cols else numeric_cols[0]
+    values = df[primary_col].dropna().tolist()
+
+    if not values:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Selected column '{primary_col}' contains no valid numeric values.",
+        )
+
     return compute_kpis(values, dataset_id)

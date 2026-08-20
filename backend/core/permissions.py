@@ -3,14 +3,14 @@ from apps.users.models import User
 
 
 class IsOrganizationAdmin(BasePermission):
-    """Allow access only to org-level admins."""
+    """Allow access only to org-level admins or platform staff."""
     message = "You must be an organization admin to perform this action."
 
     def has_permission(self, request, view):
         return (
             request.user
             and request.user.is_authenticated
-            and request.user.role == User.Role.ADMIN
+            and (request.user.is_staff or request.user.role == User.Role.ADMIN)
         )
 
 
@@ -38,14 +38,16 @@ class IsAdminOrReadOnly(BasePermission):
 
 
 class IsSameOrganization(BasePermission):
-    """Object-level: only allow access to objects in the user's own org."""
+    """Object-level: only allow access to objects in the user's own org.
+    Platform staff (is_staff) bypass this check.
+    """
     message = "You do not have access to this resource."
 
     def has_object_permission(self, request, view, obj):
-        # obj must have an `organization` attribute
+        if request.user and request.user.is_staff:
+            return True
         org_id = getattr(obj, "organization_id", None)
         if org_id is None:
-            # obj IS an organization
             org_id = getattr(obj, "id", None)
         return str(org_id) == str(request.user.organization_id)
 

@@ -7,6 +7,12 @@ from .models import Organization
 from .serializers import OrganizationSerializer, OrganizationCreateSerializer
 
 
+class IsStaff(permissions.BasePermission):
+    """Platform staff only (Django admin `is_staff`), e.g. for provisioning new tenants."""
+    def has_permission(self, request, view):
+        return bool(request.user and request.user.is_authenticated and request.user.is_staff)
+
+
 class OrganizationViewSet(ModelViewSet):
     queryset = Organization.objects.filter(is_active=True)
     permission_classes = [permissions.IsAuthenticated, IsSameOrganization]
@@ -17,8 +23,10 @@ class OrganizationViewSet(ModelViewSet):
         return OrganizationSerializer
 
     def get_permissions(self):
+        if self.action == "create":
+            return [permissions.IsAuthenticated(), IsStaff()]
         if self.action in ["update", "partial_update", "destroy"]:
-            return [permissions.IsAuthenticated(), IsOrganizationAdmin()]
+            return [permissions.IsAuthenticated(), IsOrganizationAdmin(), IsSameOrganization()]
         return super().get_permissions()
 
     def get_queryset(self):

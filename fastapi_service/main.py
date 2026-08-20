@@ -1,4 +1,5 @@
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, status
@@ -18,13 +19,15 @@ async def lifespan(app: FastAPI):
     logger.info("FastAPI Analytics Service shutting down…")
 
 
+PRODUCTION = os.getenv("ENV", "development") == "production"
+
 app = FastAPI(
     title="Analytics Microservice",
     description="High-performance analytics: KPIs, trends, anomalies, insights.",
     version="1.0.0",
     lifespan=lifespan,
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url=None if PRODUCTION else "/docs",
+    redoc_url=None if PRODUCTION else "/redoc",
 )
 
 app.add_middleware(

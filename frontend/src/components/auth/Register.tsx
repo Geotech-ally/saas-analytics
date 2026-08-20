@@ -13,7 +13,6 @@ export interface RegisterData {
   password_confirm: string;
   first_name: string;
   last_name: string;
-  organization_id: string;
 }
 
 
@@ -25,7 +24,6 @@ export default function Register({ onRegister, onNavigateToLogin, error, loading
     password_confirm: "",
     first_name: "",
     last_name: "",
-    organization_id: "",
   });
 
 
@@ -38,15 +36,7 @@ export default function Register({ onRegister, onNavigateToLogin, error, loading
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    // Avoid sending empty string; backend will auto-create org when null/omitted.
-    const organization_id = formData.organization_id?.trim() ? formData.organization_id : undefined as any;
-    const payload: RegisterData = {
-      ...formData,
-      organization_id,
-    };
-
-
-    await onRegister(payload);
+    await onRegister(formData);
   };
 
 
@@ -110,17 +100,6 @@ export default function Register({ onRegister, onNavigateToLogin, error, loading
               minLength={8}
             />
           </label>
-            <label>
-              Organization ID (optional)
-              <input
-                type="text"
-                name="organization_id"
-                value={formData.organization_id}
-                onChange={handleChange}
-                placeholder="UUID (e.g. 3fa85f64-5717-4562-b3fc-2c963f66afa6)"
-                autoComplete="off"
-              />
-            </label>
 
 
           <label>

@@ -114,6 +114,26 @@ label input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--acc
 .spinner--lg { width: 40px; height: 40px; border-width: 3px; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ── Link button (used for "Forgot password?", "Sign up", etc.) ─────────── */
+/* Previously undefined: the global `button { background: none; border: none; }`
+   reset left `color` at the browser default (near-black), which was
+   effectively invisible against the dark --bg-surface card. Any usage that
+   didn't manually add an inline color override (like "Forgot password?")
+   rendered as dark text on a dark background. */
+.link-button {
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 2px 0;
+  text-decoration: none;
+}
+.link-button:hover { color: var(--accent-hover); text-decoration: underline; }
+.link-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
 /* ── App loading ───────────────────────────────────────────────────────── */
 .app-loading {
   display: flex; align-items: center; justify-content: center;

@@ -10,11 +10,13 @@ from datetime import timedelta
 # ─────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+DJANGO_ENV = os.getenv("DJANGO_ENV", "development")
+
 # Load environment variables
 load_dotenv(BASE_DIR / ".env")
 
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", secrets.token_urlsafe(64))
-DEBUG = os.getenv("DJANGO_DEBUG", "True") == "True"
+DEBUG = os.getenv("DJANGO_DEBUG", "False").lower() == "true"
 ALLOWED_HOSTS = os.getenv(
     "DJANGO_ALLOWED_HOSTS", "localhost 127.0.0.1 testserver"
 ).split()
@@ -37,8 +39,9 @@ else:
     SECURE_HSTS_PRELOAD = True
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
     SECURE_CONTENT_TYPE_NOSNIFF = True
-    SECURE_BROWSER_XSS_FILTER = True
     X_FRAME_OPTIONS = "DENY"
+    SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
+    SECURE_CROSS_ORIGIN_OPENER_POLICY = "same-origin"
     SESSION_COOKIE_HTTPONLY = True
     CSRF_COOKIE_HTTPONLY = True
     SESSION_COOKIE_SAMESITE = "Lax"
@@ -51,6 +54,8 @@ JWT_SIGNING_SECRET = os.getenv("JWT_SIGNING_SECRET", SECRET_KEY)
 FASTAPI_SERVICE_SECRET = os.getenv(
     "FASTAPI_SERVICE_SECRET", secrets.token_urlsafe(32)
 )
+JWT_ISSUER = os.getenv("JWT_ISSUER", "datalens-backend")
+JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "datalens-api")
 
 # ─────────────────────────────────────────────────────────────
 # Applications
@@ -85,6 +90,7 @@ INSTALLED_APPS = [
     "apps.users",
     "apps.organizations",
     "apps.datasets",
+    "django_celery_beat",
 ]
 
 # ─────────────────────────────────────────────────────────────
@@ -133,7 +139,7 @@ REST_AUTH = {
     "USE_JWT": True,
     "JWT_AUTH_COOKIE": "auth-token",
     "JWT_AUTH_REFRESH_COOKIE": "refresh-token",
-    "REGISTER_SERIALIZER": "apps.users.serializers.CustomRegisterSerializer",
+    "REGISTER_SERIALIZER": "apps.users.serializers.RegisterSerializer",
     "USER_DETAILS_SERIALIZER": "apps.users.serializers.UserSerializer",
 }
 
@@ -166,10 +172,39 @@ TEMPLATES = [
 # ─────────────────────────────────────────────────────────────
 # Database
 # ─────────────────────────────────────────────────────────────
-DATABASES = {
+if os.environ.get("POSTGRES_HOST"):
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": os.environ["POSTGRES_DB"],
+            "USER": os.environ["POSTGRES_USER"],
+            "PASSWORD": os.environ["POSTGRES_PASSWORD"],
+            "HOST": os.environ.get("POSTGRES_HOST", "localhost"),
+            "PORT": os.environ.get("POSTGRES_PORT", "5432"),
+            "CONN_MAX_AGE": 60,
+            "OPTIONS": {
+                "connect_timeout": 10,
+            },
+        }
+    }
+else:
+    if DJANGO_ENV == "production":
+        raise RuntimeError("POSTGRES_HOST must be set in production.")
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": BASE_DIR / "db.sqlite3",
+        }
+    }
+
+# ─────────────────────────────────────────────────────────────
+# Cache
+# ─────────────────────────────────────────────────────────────
+CACHES = {
     "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
+        "BACKEND": "django.core.cache.backends.redis.RedisCache",
+        "LOCATION": os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
+        "TIMEOUT": 300,
     }
 }
 
@@ -178,7 +213,7 @@ DATABASES = {
 # ─────────────────────────────────────────────────────────────
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
-        "rest_framework_simplejwt.authentication.JWTAuthentication",
+        "apps.users.auth.AccessTokenOnlyAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",
@@ -221,10 +256,14 @@ CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_TIMEZONE = "UTC"
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+CELERY_BROKER_POOL_LIMIT = 10
+from celery.schedules import crontab
+
 CELERY_BEAT_SCHEDULE = {
     "weekly-analytics-report": {
         "task": "apps.datasets.tasks.send_weekly_analytics_report",
-        "schedule": 60 * 60 * 24 * 7,  # every 7 days (Saturday via crontab)
+        "schedule": crontab(minute=0, hour=8, day_of_week="sat"),
         "args": (),
     },
 }
@@ -240,6 +279,8 @@ SIMPLE_JWT = {
     "BLACKLIST_AFTER_ROTATION": True,
     "ALGORITHM": "HS256",
     "SIGNING_KEY": JWT_SIGNING_SECRET,
+    "ISSUER": JWT_ISSUER,
+    "AUDIENCE": JWT_AUDIENCE,
     "AUTH_HEADER_TYPES": ("Bearer",),
     "TOKEN_OBTAIN_SERIALIZER": "apps.users.views.CustomTokenObtainPairSerializer",
 }

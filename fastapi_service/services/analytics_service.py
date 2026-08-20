@@ -4,7 +4,7 @@ Designed to be stateless and easily testable.
 """
 import math
 import statistics
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 from uuid import UUID
 
@@ -54,7 +54,7 @@ def compute_kpis(
         min_value=round(min_val, 4),
         max_value=round(max_val, 4),
         growth_rate=round(growth_rate, 2) if growth_rate is not None else None,
-        computed_at=datetime.utcnow(),
+        computed_at=datetime.now(timezone.utc),
     )
 
 

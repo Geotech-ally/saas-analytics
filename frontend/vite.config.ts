@@ -7,14 +7,19 @@ export default defineConfig({
     port: 3000,
     proxy: {
       "/api/django": {
-        target: process.env.VITE_DJANGO_URL ?? "http://localhost:8000",
+        target: process.env.VITE_DJANGO_URL,
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api\/django/, ""),
       },
       "/api/analytics": {
-        target: process.env.VITE_FASTAPI_URL ?? "http://localhost:8001",
+        target: process.env.VITE_FASTAPI_URL,
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api\/analytics/, ""),
+      },
+      "/accounts/": {
+        target: process.env.VITE_DJANGO_URL,
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/accounts/, "/accounts"),
       },
     },
   },

@@ -15,9 +15,11 @@ from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 from core.permissions import IsOrganizationAdmin, IsSameOrganization, IsAdminOrReadOnly
 from core.throttles import LoginAnonThrottle, LoginBlockThrottle, PasswordResetAnonThrottle, PasswordResetBlockThrottle
+from .claims import build_user_claims, issue_user_tokens
 from .serializers import (
     UserSerializer,
     UserCreateSerializer,
+    RegisterSerializer,
     UserUpdateSerializer,
     UserRoleUpdateSerializer,
     ChangePasswordSerializer,
@@ -38,11 +40,8 @@ logger = logging.getLogger(__name__)
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
     @classmethod
     def get_token(cls, user):
-        token = super().get_token(user)
-        token["email"] = user.email
-        token["role"] = user.role
-        token["org_id"] = str(user.organization_id) if user.organization_id else None
-        return token
+        _, refresh = issue_user_tokens(user)
+        return refresh
 
 
 class CustomTokenObtainPairView(TokenObtainPairView):
@@ -72,7 +71,7 @@ class UserViewSet(ModelViewSet):
     def perform_create(self, serializer):
         user = self.request.user
         instance = serializer.save()
-        if not instance.organization and user.organization:
+        if user.organization:
             instance.organization = user.organization
             instance.save(update_fields=["organization"])
 
@@ -119,7 +118,12 @@ class UserViewSet(ModelViewSet):
 
 
 class RegisterView(generics.CreateAPIView):
-    serializer_class = UserCreateSerializer
+    """Public endpoint: register a new user + a brand-new organization for them.
+
+    Uses RegisterSerializer specifically — never UserCreateSerializer — so
+    role and organization_id can never be supplied by an anonymous caller.
+    """
+    serializer_class = RegisterSerializer
     permission_classes = [permissions.AllowAny]
 
     def create(self, request, *args, **kwargs):

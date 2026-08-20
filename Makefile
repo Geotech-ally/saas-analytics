@@ -53,7 +53,7 @@ shell-db:
 
 # Local dev (without Docker)
 dev-django:
-	cd django_backend && python manage.py runserver 0.0.0.0:8000
+	cd backend && python manage.py runserver 0.0.0.0:8000
 
 dev-fastapi:
 	cd fastapi_service && uvicorn main:app --reload --port 8001

@@ -10,9 +10,14 @@ import tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "fastapi_service"))
 
+# Tests must run with DEBUG=True so SECURE_SSL_REDIRECT does not force
+# HTTPS redirects in the test client.
+os.environ.setdefault("DJANGO_DEBUG", "True")
+
 import jwt
 from django.test import TestCase, override_settings
 from django.urls import reverse
+from django.conf import settings
 from rest_framework import status
 from rest_framework.test import APIClient
 
@@ -43,9 +48,38 @@ def get_list_results(resp):
     return resp.data.get("results", [])
 
 
-# ── Auth Tests ─────────────────────────────────────────────────────────────
-class AuthTests(TestCase):
+class BaseTestCase(TestCase):
+    """Ensure tests run without SSL redirects."""
     def setUp(self):
+        super().setUp()
+        self._debug_patch = override_settings(
+            DEBUG=True,
+            SECURE_SSL_REDIRECT=False,
+            SECURE_HSTS_SECONDS=0,
+            SECURE_PROXY_SSL_HEADER=None,
+            REST_FRAMEWORK={
+                **settings.REST_FRAMEWORK,
+                "DEFAULT_THROTTLE_RATES": {
+                    "anon": "1000/min",
+                    "user": "10000/min",
+                    "login": "1000/min",
+                    "login_block": "10000/min",
+                    "password_reset": "1000/min",
+                    "password_reset_block": "10000/min",
+                },
+            },
+        )
+        self._debug_patch.enable()
+
+    def tearDown(self):
+        self._debug_patch.disable()
+        super().tearDown()
+
+
+# ── Auth Tests ─────────────────────────────────────────────────────────────
+class AuthTests(BaseTestCase):
+    def setUp(self):
+        super().setUp()
         self.client = APIClient()
         self.org = make_org()
         self.user = make_user(self.org, email="auth@acme.com")
@@ -96,7 +130,13 @@ class AuthTests(TestCase):
         tokens = get_tokens(self.client, "auth@acme.com")
         from django.conf import settings
         secret = getattr(settings, "JWT_SIGNING_SECRET", settings.SECRET_KEY)
-        payload = jwt.decode(tokens["access"], secret, algorithms=["HS256"])
+        payload = jwt.decode(
+            tokens["access"],
+            secret,
+            algorithms=["HS256"],
+            audience=settings.JWT_AUDIENCE,
+            issuer=settings.JWT_ISSUER,
+        )
         self.assertIn("role", payload)
         self.assertIn("org_id", payload)
         self.assertIn("email", payload)
@@ -110,8 +150,9 @@ class AuthTests(TestCase):
 
 
 # ── Organization Tests ──────────────────────────────────────────────────────
-class OrganizationTests(TestCase):
+class OrganizationTests(BaseTestCase):
     def setUp(self):
+        super().setUp()
         self.client = APIClient()
         self.org = make_org()
         self.admin = make_user(self.org, email="admin@acme.com", role=User.Role.ADMIN)
@@ -155,10 +196,26 @@ class OrganizationTests(TestCase):
         resp = self.client.get(reverse("organization-detail", args=[other_org.id]))
         self.assertIn(resp.status_code, [status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND])
 
+    def test_admin_cannot_update_other_org(self):
+        other_org = make_org(name="Other", slug="other-org")
+        self._auth("admin@acme.com")
+        resp = self.client.patch(
+            reverse("organization-detail", args=[other_org.id]),
+            {"name": "Hacked"},
+        )
+        self.assertIn(resp.status_code, [status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND])
+
+    def test_admin_cannot_delete_other_org(self):
+        other_org = make_org(name="Other", slug="other-del")
+        self._auth("admin@acme.com")
+        resp = self.client.delete(reverse("organization-detail", args=[other_org.id]))
+        self.assertIn(resp.status_code, [status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND])
+
 
 # ── User Management Tests ───────────────────────────────────────────────────
-class UserManagementTests(TestCase):
+class UserManagementTests(BaseTestCase):
     def setUp(self):
+        super().setUp()
         self.client = APIClient()
         self.org = make_org()
         self.admin = make_user(self.org, email="admin@acme.com", role=User.Role.ADMIN)
@@ -230,8 +287,9 @@ class UserManagementTests(TestCase):
 
 
 # ── RBAC / Tenant Isolation Tests ──────────────────────────────────────────
-class TenantIsolationTests(TestCase):
+class TenantIsolationTests(BaseTestCase):
     def setUp(self):
+        super().setUp()
         self.client = APIClient()
         self.org_a = make_org(name="Org A", slug="org-a")
         self.org_b = make_org(name="Org B", slug="org-b")
@@ -274,10 +332,25 @@ class TenantIsolationTests(TestCase):
         resp = self.client.get(reverse("dataset-detail", args=[dataset_b.id]))
         self.assertIn(resp.status_code, [status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND])
 
+    def test_admin_a_cannot_set_role_for_org_b_user(self):
+        self._auth("a@orga.com")
+        resp = self.client.post(
+            reverse("user-set-role", args=[self.user_b.id]),
+            {"role": "admin"},
+        )
+        self.assertIn(resp.status_code, [status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND])
+
+    def test_admin_a_cannot_list_org_b_users(self):
+        self._auth("a@orga.com")
+        resp = self.client.get(reverse("user-list"))
+        emails = [u["email"] for u in get_list_results(resp)]
+        self.assertNotIn("b@orgb.com", emails)
+
 
 # ── File Upload Security Tests ─────────────────────────────────────────
-class FileUploadSecurityTests(TestCase):
+class FileUploadSecurityTests(BaseTestCase):
     def setUp(self):
+        super().setUp()
         self.client = APIClient()
         self.org = make_org()
         self.user = make_user(self.org, email="uploader@acme.com")
@@ -341,10 +414,88 @@ class FileUploadSecurityTests(TestCase):
                 )
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
 
+    def test_upload_invalid_content_rejected(self):
+        self._auth()
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+            tmp.write(b"\xFF\xFE\xFD\xFC\xFB\xFA\xF9\xF8\xF7\xF6")
+            tmp.seek(0)
+            with open(tmp.name, "rb") as f:
+                resp = self.client.post(
+                    reverse("dataset-list"),
+                    {"name": "Bad Content", "file": f},
+                    format="multipart",
+                )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+# ── Dataset Security Tests ─────────────────────────────────────────
+class DatasetSecurityTests(BaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.client = APIClient()
+        self.org = make_org()
+        self.owner = make_user(self.org, email="owner@acme.com")
+        self.member = make_user(self.org, email="member@acme.com")
+        self.admin = make_user(self.org, email="admin@acme.com", role=User.Role.ADMIN)
+
+    def _auth(self, email):
+        tokens = get_tokens(self.client, email)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {tokens['access']}")
+
+    def test_owner_can_update_own_dataset(self):
+        dataset = Dataset.objects.create(
+            name="Owner Dataset",
+            organization=self.org,
+            uploaded_by=self.owner,
+        )
+        self._auth("owner@acme.com")
+        resp = self.client.patch(
+            reverse("dataset-detail", args=[dataset.id]),
+            {"name": "Updated Name"},
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    def test_member_cannot_update_others_dataset(self):
+        dataset = Dataset.objects.create(
+            name="Member Dataset",
+            organization=self.org,
+            uploaded_by=self.owner,
+        )
+        self._auth("member@acme.com")
+        resp = self.client.patch(
+            reverse("dataset-detail", args=[dataset.id]),
+            {"name": "Hacked"},
+        )
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_admin_can_update_any_dataset_in_org(self):
+        dataset = Dataset.objects.create(
+            name="Admin Dataset",
+            organization=self.org,
+            uploaded_by=self.owner,
+        )
+        self._auth("admin@acme.com")
+        resp = self.client.patch(
+            reverse("dataset-detail", args=[dataset.id]),
+            {"name": "Admin Updated"},
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    def test_member_cannot_delete_others_dataset(self):
+        dataset = Dataset.objects.create(
+            name="Delete Dataset",
+            organization=self.org,
+            uploaded_by=self.owner,
+        )
+        self._auth("member@acme.com")
+        resp = self.client.delete(reverse("dataset-detail", args=[dataset.id]))
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
 
 # ── Logout & Token Invalidation Tests ──────────────────────────────────
-class LogoutTests(TestCase):
+class LogoutTests(BaseTestCase):
     def setUp(self):
+        super().setUp()
         self.client = APIClient()
         self.org = make_org()
         self.user = make_user(self.org, email="logout@acme.com")
@@ -378,8 +529,9 @@ class LogoutTests(TestCase):
 
 
 # ── Password Reset Security Tests ────────────────────────────────────
-class PasswordResetSecurityTests(TestCase):
+class PasswordResetSecurityTests(BaseTestCase):
     def setUp(self):
+        super().setUp()
         self.client = APIClient()
         self.org = make_org()
         self.user = make_user(self.org, email="reset@acme.com")
@@ -407,17 +559,27 @@ class PasswordResetSecurityTests(TestCase):
 
 
 # ── Internal JWT Service Token Tests ──────────────────────────────────
-class ServiceTokenTests(TestCase):
+class ServiceTokenTests(BaseTestCase):
     def test_make_service_token_is_valid_jwt(self):
         import os
         test_secret = "test-fastapi-service-secret-for-pytest"
+        test_issuer = "test-issuer"
+        test_audience = "test-audience"
         os.environ["FASTAPI_SERVICE_SECRET"] = test_secret
         os.environ["JWT_SIGNING_SECRET"] = "test-jwt-signing-secret"
+        os.environ["JWT_ISSUER"] = test_issuer
+        os.environ["JWT_AUDIENCE"] = test_audience
 
         from fastapi_service.core.auth import _make_service_token
 
         token = _make_service_token()
-        payload = jwt.decode(token, test_secret, algorithms=["HS256"])
+        payload = jwt.decode(
+            token,
+            test_secret,
+            algorithms=["HS256"],
+            audience=test_audience,
+            issuer=test_issuer,
+        )
         self.assertIn("service_name", payload)
         self.assertEqual(payload["service_name"], "django-backend")
         self.assertIn("exp", payload)
@@ -441,7 +603,7 @@ class ServiceTokenTests(TestCase):
 
 
 # ── Production Security Settings Tests ───────────────────────────────
-class SecuritySettingsTests(TestCase):
+class SecuritySettingsTests(BaseTestCase):
     def test_security_settings_exist_in_settings(self):
         """Verify that all production security settings are defined."""
         from django.conf import settings
@@ -482,7 +644,7 @@ class SecuritySettingsTests(TestCase):
 
 
 # ── Rate Limiting Tests ──────────────────────────────────────────────
-class RateLimitingTests(TestCase):
+class RateLimitingTests(BaseTestCase):
     def test_login_throttle_rates_defined(self):
         from django.conf import settings
         rates = settings.REST_FRAMEWORK.get("DEFAULT_THROTTLE_RATES", {})
@@ -504,3 +666,260 @@ class RateLimitingTests(TestCase):
         from core.throttles import PasswordResetAnonThrottle, PasswordResetBlockThrottle
         self.assertEqual(PasswordResetAnonThrottle.scope, "password_reset")
         self.assertEqual(PasswordResetBlockThrottle.scope, "password_reset_block")
+
+
+# ── JWT Claims & Token Type Tests ─────────────────────────────────────
+class JWTClaimsTests(BaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.client = APIClient()
+        self.org = make_org()
+        self.user = make_user(self.org, email="claims@acme.com")
+
+    def test_access_token_contains_issuer_and_audience(self):
+        tokens = get_tokens(self.client, "claims@acme.com")
+        payload = jwt.decode(
+            tokens["access"],
+            settings.JWT_SIGNING_SECRET,
+            algorithms=["HS256"],
+            audience=settings.JWT_AUDIENCE,
+            issuer=settings.JWT_ISSUER,
+        )
+        self.assertEqual(payload["iss"], settings.JWT_ISSUER)
+        self.assertEqual(payload["aud"], settings.JWT_AUDIENCE)
+
+    def test_refresh_token_contains_issuer_and_audience(self):
+        tokens = get_tokens(self.client, "claims@acme.com")
+        payload = jwt.decode(
+            tokens["refresh"],
+            settings.JWT_SIGNING_SECRET,
+            algorithms=["HS256"],
+            audience=settings.JWT_AUDIENCE,
+            issuer=settings.JWT_ISSUER,
+        )
+        self.assertEqual(payload["iss"], settings.JWT_ISSUER)
+        self.assertEqual(payload["aud"], settings.JWT_AUDIENCE)
+
+    def test_access_token_contains_email_role_org_id(self):
+        tokens = get_tokens(self.client, "claims@acme.com")
+        payload = jwt.decode(
+            tokens["access"],
+            settings.JWT_SIGNING_SECRET,
+            algorithms=["HS256"],
+            audience=settings.JWT_AUDIENCE,
+            issuer=settings.JWT_ISSUER,
+        )
+        self.assertEqual(payload["email"], "claims@acme.com")
+        self.assertEqual(payload["role"], "user")
+        self.assertEqual(payload["org_id"], str(self.org.id))
+
+    def test_access_and_refresh_tokens_have_matching_claims(self):
+        tokens = get_tokens(self.client, "claims@acme.com")
+        from django.conf import settings
+        secret = getattr(settings, "JWT_SIGNING_SECRET", settings.SECRET_KEY)
+        access_payload = jwt.decode(
+            tokens["access"],
+            secret,
+            algorithms=["HS256"],
+            audience=settings.JWT_AUDIENCE,
+            issuer=settings.JWT_ISSUER,
+        )
+        refresh_payload = jwt.decode(
+            tokens["refresh"],
+            secret,
+            algorithms=["HS256"],
+            audience=settings.JWT_AUDIENCE,
+            issuer=settings.JWT_ISSUER,
+        )
+        self.assertEqual(access_payload["email"], refresh_payload["email"])
+        self.assertEqual(access_payload["role"], refresh_payload["role"])
+        self.assertEqual(access_payload["org_id"], refresh_payload["org_id"])
+
+    def test_refresh_token_rejected_by_api(self):
+        tokens = get_tokens(self.client, "claims@acme.com")
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {tokens['refresh']}")
+        resp = self.client.get(reverse("user-me"))
+        self.assertEqual(resp.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+# ── Inactive User Authentication Tests ──────────────────────────────────
+class InactiveUserAuthTests(BaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.client = APIClient()
+        self.org = make_org()
+        self.inactive_user = User.objects.create_user(
+            email="inactive@acme.com",
+            password="Test1234!",
+            organization=self.org,
+            is_active=False,
+        )
+
+    def test_inactive_user_cannot_obtain_token(self):
+        resp = self.client.post(
+            reverse("token_obtain"),
+            {"email": "inactive@acme.com", "password": "Test1234!"},
+        )
+        self.assertEqual(resp.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_active_user_can_access_protected_endpoint(self):
+        active = User.objects.create_user(
+            email="active@acme.com",
+            password="Test1234!",
+            organization=self.org,
+            is_active=True,
+        )
+        tokens = get_tokens(self.client, "active@acme.com")
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {tokens['access']}")
+        resp = self.client.get(reverse("user-me"))
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    def test_inactive_user_token_rejected_by_api(self):
+        inactive = User.objects.create_user(
+            email="inactive-token@acme.com",
+            password="Test1234!",
+            organization=self.org,
+            is_active=False,
+        )
+        from rest_framework_simplejwt.tokens import AccessToken
+        access = AccessToken.for_user(inactive)
+        access["token_type"] = "access"
+        access["email"] = inactive.email
+        access["role"] = inactive.role
+        access["org_id"] = str(inactive.organization_id)
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        resp = self.client.get(reverse("user-me"))
+        self.assertEqual(resp.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+# ── Social Login JWT Claims Tests ────────────────────────────────────────
+class SocialJWTClaimsTests(BaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.client = APIClient()
+        self.org = make_org()
+
+    def test_social_token_exchange_rejects_inactive_user(self):
+        from unittest.mock import patch
+        inactive = User.objects.create_user(
+            email="social-inactive@acme.com",
+            password="Test1234!",
+            organization=self.org,
+            is_active=False,
+        )
+        with patch("apps.users.views_social.SocialTokenExchangeView._verify_google_token", return_value=inactive):
+            resp = self.client.post(
+                reverse("social_token_exchange"),
+                data={"access_token": "fake-google-token"},
+                format="json",
+            )
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_social_token_exchange_returns_correct_claims(self):
+        from unittest.mock import patch
+        admin = User.objects.create_user(
+            email="social-claims@acme.com",
+            password="Test1234!",
+            organization=self.org,
+            role=User.Role.ADMIN,
+        )
+        with patch("apps.users.views_social.SocialTokenExchangeView._verify_google_token", return_value=admin):
+            resp = self.client.post(
+                reverse("social_token_exchange"),
+                data={"access_token": "fake-google-token"},
+                format="json",
+            )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertIn("access", resp.data)
+        self.assertIn("refresh", resp.data)
+
+        from django.conf import settings
+        secret = getattr(settings, "JWT_SIGNING_SECRET", settings.SECRET_KEY)
+        access_payload = jwt.decode(
+            resp.data["access"],
+            secret,
+            algorithms=["HS256"],
+            audience=settings.JWT_AUDIENCE,
+            issuer=settings.JWT_ISSUER,
+        )
+        self.assertEqual(access_payload["email"], "social-claims@acme.com")
+        self.assertEqual(access_payload["role"], "admin")
+        self.assertEqual(access_payload["org_id"], str(self.org.id))
+
+
+# ── Token Revocation & Middleware Tests ──────────────────────────────────
+class TokenRevocationTests(BaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.client = APIClient()
+        self.org = make_org()
+        self.user = make_user(self.org, email="revoke@acme.com")
+
+    def _get_tokens(self):
+        return get_tokens(self.client, "revoke@acme.com")
+
+    def _extract_jti(self, token_str):
+        import jwt
+        payload = jwt.decode(token_str, options={"verify_signature": False})
+        return payload.get("jti")
+
+    def test_logout_stores_access_jti_in_redis(self):
+        tokens = self._get_tokens()
+        access_jti = self._extract_jti(tokens["access"])
+        refresh_jti = self._extract_jti(tokens["refresh"])
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {tokens['access']}")
+        resp = self.client.get(reverse("user-me"))
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        resp = self.client.post(
+            reverse("logout"),
+            {"refresh": tokens["refresh"], "access": tokens["access"]},
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        from django.core.cache import cache
+        self.assertIsNotNone(cache.get(f"revoked_jti:{access_jti}"))
+        self.assertIsNotNone(cache.get(f"revoked_jti:{refresh_jti}"))
+
+    def test_middleware_blocks_revoked_access_token(self):
+        tokens = self._get_tokens()
+        access_jti = self._extract_jti(tokens["access"])
+
+        from django.core.cache import cache
+        cache.set(f"revoked_jti:{access_jti}", True, timeout=60)
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {tokens['access']}")
+        resp = self.client.get(reverse("user-me"))
+        self.assertEqual(resp.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_middleware_blocks_revoked_refresh_token(self):
+        tokens = self._get_tokens()
+        refresh_jti = self._extract_jti(tokens["refresh"])
+
+        from django.core.cache import cache
+        cache.set(f"revoked_jti:{refresh_jti}", True, timeout=60)
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {tokens['refresh']}")
+        resp = self.client.get(reverse("user-me"))
+        self.assertEqual(resp.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_middleware_fails_closed_on_cache_failure(self):
+        tokens = self._get_tokens()
+
+        from django.core.cache import cache
+        original_get = cache.get
+
+        def failing_get(key, default=None, version=None):
+            if key.startswith("revoked_jti:"):
+                raise Exception("Cache connection lost")
+            return original_get(key, default, version)
+
+        cache.get = failing_get
+        try:
+            self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {tokens['access']}")
+            resp = self.client.get(reverse("user-me"))
+            self.assertEqual(resp.status_code, status.HTTP_401_UNAUTHORIZED)
+        finally:
+            cache.get = original_get

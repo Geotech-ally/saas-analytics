@@ -3,9 +3,8 @@ from rest_framework import permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
-from rest_framework_simplejwt.tokens import AccessToken
 
-from core.permissions import IsOrganizationMember, IsOwnerOrAdmin, IsSameOrganization
+from core.permissions import IsOrganizationMember, IsOwnerOrAdmin
 from .models import Dataset
 from .serializers import DatasetSerializer
 from .tasks import process_dataset_async
@@ -31,7 +30,7 @@ class DatasetViewSet(ModelViewSet):
         return qs
 
     def get_permissions(self):
-        if self.action in ["destroy"]:
+        if self.action in ["update", "partial_update", "destroy"]:
             return [permissions.IsAuthenticated(), IsOwnerOrAdmin()]
         return super().get_permissions()
 

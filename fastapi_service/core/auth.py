@@ -7,6 +7,7 @@ import os
 from typing import Optional
 
 import jwt
+import redis
 from fastapi import Depends, HTTPException, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -23,12 +24,65 @@ FASTAPI_SERVICE_SECRET = os.environ.get("FASTAPI_SERVICE_SECRET")
 if not FASTAPI_SERVICE_SECRET:
     raise RuntimeError("FASTAPI_SERVICE_SECRET environment variable is required.")
 
+JWT_ISSUER = os.environ.get("JWT_ISSUER", "datalens-backend")
+JWT_AUDIENCE = os.environ.get("JWT_AUDIENCE", "datalens-api")
+
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+_redis_client = None
+
 SERVICE_TOKEN_LIFETIME_SECONDS = int(os.environ.get("SERVICE_TOKEN_LIFETIME_SECONDS", "300"))
+
+
+def _get_redis():
+    global _redis_client
+    if _redis_client is None:
+        try:
+            _redis_client = redis.from_url(REDIS_URL, socket_connect_timeout=2, socket_timeout=2)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Revocation service unavailable.",
+            )
+    return _redis_client
+
+
+def _is_jti_revoked(jti: str) -> bool:
+    """Check whether a token jti has been revoked in Redis."""
+    if not jti:
+        return False
+    try:
+        client = _get_redis()
+        return client.get(f"revoked_jti:{jti}") is not None
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Revocation service unavailable.",
+        )
 
 
 def _decode_token(token: str) -> TokenClaims:
     try:
-        payload = jwt.decode(token, JWT_SIGNING_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(
+            token,
+            JWT_SIGNING_SECRET,
+            algorithms=[JWT_ALGORITHM],
+            audience=JWT_AUDIENCE,
+            issuer=JWT_ISSUER,
+            options={"require": ["exp", "iat", "sub"]},
+        )
+
+        jti = payload.get("jti")
+        if jti and _is_jti_revoked(jti):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token has been revoked.",
+            )
+
+        if payload.get("token_type") != "access":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Access token required.",
+            )
         return TokenClaims(**payload)
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired.")
@@ -67,9 +121,12 @@ def _make_service_token() -> str:
     now = int(time.time())
     payload = {
         "service_name": "django-backend",
+        "token_type": "service",
         "iat": now,
         "exp": now + SERVICE_TOKEN_LIFETIME_SECONDS,
         "nbf": now,
+        "iss": JWT_ISSUER,
+        "aud": JWT_AUDIENCE,
     }
     return jwt.encode(payload, FASTAPI_SERVICE_SECRET, algorithm=JWT_ALGORITHM)
 
@@ -77,28 +134,35 @@ def _make_service_token() -> str:
 def verify_service_key(x_service_key: Optional[str] = None) -> bool:
     """Validates the internal service token on internal endpoints.
 
-    Accepts either a legacy static key (for compatibility) or a JWT-signed
-    service token.  The static key is read from INTERNAL_SERVICE_KEY for
-    backward compatibility but is deprecated in production.
+    Only accepts a short-lived JWT-signed service token.
     """
     if x_service_key is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Service key or internal token is required.",
+            detail="Service token is required.",
         )
 
-    # Check legacy static key first (backward compatibility)
-    legacy_key = os.environ.get("INTERNAL_SERVICE_KEY")
-    if legacy_key and x_service_key == legacy_key:
-        return True
-
-    # Verify JWT service token
     try:
         payload = jwt.decode(x_service_key, FASTAPI_SERVICE_SECRET, algorithms=[JWT_ALGORITHM])
         if payload.get("service_name") != "django-backend":
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Invalid service token.",
+            )
+        if payload.get("token_type") != "service":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Invalid token type.",
+            )
+        if payload.get("iss") != JWT_ISSUER:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Invalid token issuer.",
+            )
+        if payload.get("aud") != JWT_AUDIENCE:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Invalid token audience.",
             )
         return True
     except jwt.ExpiredSignatureError:

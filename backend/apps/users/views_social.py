@@ -4,7 +4,8 @@ from django.http import HttpRequest
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework_simplejwt.tokens import RefreshToken
+
+from .claims import issue_user_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -62,10 +63,16 @@ class SocialTokenExchangeView(APIView):
     # ------------------------------------------------------------------
 
     def _issue_tokens(self, user: User) -> Response:
-        refresh = RefreshToken.for_user(user)
+        if not user.is_active:
+            return Response(
+                {"detail": "Account is disabled."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        access, refresh = issue_user_tokens(user)
         return Response(
             {
-                "access": str(refresh.access_token),
+                "access": str(access),
                 "refresh": str(refresh),
             },
         )

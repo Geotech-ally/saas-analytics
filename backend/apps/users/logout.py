@@ -1,32 +1,28 @@
-import hashlib
+import logging
 
-from django.core.cache import cache
 from rest_framework import status, permissions
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
+from rest_framework_simplejwt.exceptions import TokenError
+from rest_framework_simplejwt.tokens import RefreshToken
 
-CACHE_KEY_PREFIX = "blacklisted_token:"
-CACHE_TTL = 60 * 60 * 24 * 30  # 30 days (max token lifetime)
+from .claims import extract_jti
 
-
-def _token_fingerprint(token_str: str) -> str:
-    return hashlib.sha256(token_str.encode()).hexdigest()
-
-
-def _blacklist_token(token_str: str) -> None:
-    fp = _token_fingerprint(token_str)
-    ttl = CACHE_TTL
-    cache.set(f"{CACHE_KEY_PREFIX}{fp}", True, timeout=ttl)
-
-
-def _is_token_blacklisted(token_str: str) -> bool:
-    fp = _token_fingerprint(token_str)
-    return cache.get(f"{CACHE_KEY_PREFIX}{fp}") is True
+logger = logging.getLogger(__name__)
 
 
 class LogoutView(APIView):
-    """Secure JWT logout with token blacklisting."""
+    """JWT logout.
+
+    Requires the client to send a refresh token in the request body.
+    Optionally accepts an ``access`` token to revoke the current session
+    immediately rather than waiting for the short-lived access token to
+    expire.
+
+    Revocation works by storing each token's ``jti`` in Redis.  The
+    ``TokenBlacklistMiddleware`` then rejects any request presenting a
+    revoked ``jti``.
+    """
 
     authentication_classes = []
     permission_classes = [permissions.AllowAny]
@@ -37,33 +33,43 @@ class LogoutView(APIView):
 
         if not refresh_token and not access_token:
             return Response(
-                {"detail": "At least one of refresh or access token is required."},
+                {"detail": "Refresh token or access token is required."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Blacklist the refresh token
+        revoked_jtis = set()
+
         if refresh_token:
             try:
                 token = RefreshToken(refresh_token)
-                _blacklist_token(str(token))
-            except Exception:
+                jti = token.get("jti")
+                if jti:
+                    revoked_jtis.add(jti)
+                token.blacklist()
+            except TokenError:
                 pass
+            except Exception:
+                logger.exception("Unexpected error blacklisting refresh token on logout.")
+                return Response(
+                    {"detail": "Could not process logout. Please try again."},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
 
-        # Blacklist the access token
         if access_token:
-            _blacklist_token(access_token)
+            jti = extract_jti(access_token)
+            if jti:
+                revoked_jtis.add(jti)
 
-        # Flush Django session if one exists
-        if request.user and request.user.is_authenticated:
-            request.session.flush()
+        if revoked_jtis:
+            self._store_revoked_jtis(revoked_jtis)
 
-        return Response(
-            {"detail": "Logged out. All tokens invalidated."},
-            status=status.HTTP_200_OK,
-        )
+        return Response({"detail": "Logged out."}, status=status.HTTP_200_OK)
 
-
-def is_token_blacklisted(token_str: str) -> bool:
-    """Check if a token has been blacklisted (for middleware use)."""
-    return _is_token_blacklisted(token_str)
-
+    def _store_revoked_jtis(self, jtis):
+        """Persist revoked jti values in Redis with a safe TTL."""
+        try:
+            from django.core.cache import cache
+            for jti in jtis:
+                cache.set(f"revoked_jti:{jti}", True, timeout=60 * 60 * 24 * 7)
+        except Exception:
+            logger.exception("Failed to persist revoked jti values in cache.")

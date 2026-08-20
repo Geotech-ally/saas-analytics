@@ -6,6 +6,27 @@ from .models import Dataset
 logger = logging.getLogger(__name__)
 
 
+def _sanitize_filename(filename: str) -> str:
+    name = os.path.basename(filename)
+    name = name.replace("\\", "_").replace("/", "_").replace("..", "_")
+    return name
+
+
+def _validate_file_magic(value):
+    header = value.read(8)
+    value.seek(0)
+    if header.startswith(b"PK\x03\x04"):
+        return
+    if header.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"):
+        return
+    try:
+        header.decode("utf-8")
+    except UnicodeDecodeError:
+        raise serializers.ValidationError(
+            "File does not appear to be a valid CSV, Excel, or JSON file."
+        )
+
+
 class DatasetSerializer(serializers.ModelSerializer):
     uploaded_by_email = serializers.CharField(source="uploaded_by.email", read_only=True)
 
@@ -28,6 +49,8 @@ class DatasetSerializer(serializers.ModelSerializer):
             "text/csv",
             "application/vnd.ms-excel",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/json",
+            "application/octet-stream",
         ]
         if value.size > max_size:
             raise serializers.ValidationError("File size must not exceed 10 MB.")
@@ -35,9 +58,15 @@ class DatasetSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 "Unsupported file type. Use CSV or Excel (.csv, .xlsx, .xls)."
             )
-        filename = value.name
-        if ".." in filename or "/" in filename:
-            raise serializers.ValidationError("Invalid file name. Path traversal is not allowed.")
+        filename = _sanitize_filename(value.name)
+        ext = os.path.splitext(filename)[1].lower()
+        allowed_extensions = [".csv", ".xlsx", ".xls"]
+        if ext not in allowed_extensions:
+            raise serializers.ValidationError(
+                f"Unsupported file extension '{ext}'. Allowed: {', '.join(allowed_extensions)}"
+            )
+        _validate_file_magic(value)
+        value.name = filename
         return value
 
     def create(self, validated_data):

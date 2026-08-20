@@ -11,10 +11,25 @@ jobs:
   backend:
     name: Backend Tests
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
 
     env:
+      DJANGO_SECRET_KEY: ci-test-secret-key-not-for-production
+      JWT_SIGNING_SECRET: ci-test-jwt-secret-not-for-production
+      FASTAPI_SERVICE_SECRET: ci-test-fastapi-secret-not-for-production
       INTERNAL_SERVICE_KEY: ci-test-service-token-123
+      POSTGRES_DB: ci_test_db
+      POSTGRES_USER: ci_test_user
+      POSTGRES_PASSWORD: ci_test_password
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      REDIS_URL: redis://localhost:6379/0
+      CELERY_BROKER_URL: redis://localhost:6379/0
+      CELERY_RESULT_BACKEND: redis://localhost:6379/0
       FASTAPI_BASE_URL: http://localhost:8001
+      DJANGO_DEBUG: "True"
 
     steps:
       - uses: actions/checkout@v4
@@ -61,18 +76,19 @@ jobs:
       - name: Build
         working-directory: frontend
         env:
-          VITE_DJANGO_URL: http://localhost:8000
-          VITE_FASTAPI_URL: http://localhost:8001
+          VITE_DJANGO_URL: /api/django
+          VITE_FASTAPI_URL: /api/analytics
         run: npm run build
 
-      # ✅ ROOT STATIC CHECK (your fix requirement)
-      - name: Verify Core Static Files (Root)
+      # ✅ FRONTEND CORE FILE CHECK
+      - name: Verify Core Frontend Files
+        working-directory: frontend
         run: |
-          echo "Checking system layout at root..."
+          echo "Checking frontend layout..."
           test -f index.html && echo "✓ index.html found" || (echo "✗ index.html missing" && exit 1)
-          test -f style.css && echo "✓ style.css found" || (echo "✗ style.css missing" && exit 1)
-          test -f app.js && echo "✓ app.js found" || (echo "✗ app.js missing" && exit 1)
-          echo "All static assets verified!"
+          test -f src/main.tsx && echo "✓ src/main.tsx found" || (echo "✗ src/main.tsx missing" && exit 1)
+          test -f src/App.tsx && echo "✓ src/App.tsx found" || (echo "✗ src/App.tsx missing" && exit 1)
+          echo "All frontend assets verified!"
 
 
   # ── Docker Smoke Test ─────────────────────────────────────────
@@ -82,6 +98,18 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Create environment file
+        run: |
+          cat > .env << EOF
+          DJANGO_SECRET_KEY=ci-test-secret-key-not-for-production
+          JWT_SIGNING_SECRET=ci-test-jwt-secret-not-for-production
+          FASTAPI_SERVICE_SECRET=ci-test-fastapi-secret-not-for-production
+          INTERNAL_SERVICE_KEY=ci-test-service-token-123
+          POSTGRES_DB=ci_test_db
+          POSTGRES_USER=ci_test_user
+          POSTGRES_PASSWORD=ci_test_password
+          EOF
 
       - name: Build containers
         run: docker compose build

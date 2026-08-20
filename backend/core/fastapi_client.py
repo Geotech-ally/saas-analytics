@@ -28,6 +28,7 @@ def _make_service_token() -> str:
     now = int(time.time())
     payload = {
         "service_name": "django-backend",
+        "token_type": "service",
         "iat": now,
         "exp": now + SERVICE_TOKEN_LIFETIME,
         "nbf": now,

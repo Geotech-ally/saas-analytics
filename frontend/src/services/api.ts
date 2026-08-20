@@ -1,25 +1,25 @@
 import axios, { AxiosInstance, InternalAxiosRequestConfig } from "axios";
 
-// ── Token storage ──────────────────────────────────────────────────────────
+// ── Token storage (sessionStorage limits XSS exposure to tab lifetime) ──────
 const TOKEN_KEY = "access_token";
 const REFRESH_KEY = "refresh_token";
 
 export const tokenStorage = {
-  getAccess: () => localStorage.getItem(TOKEN_KEY),
-  getRefresh: () => localStorage.getItem(REFRESH_KEY),
+  getAccess: () => sessionStorage.getItem(TOKEN_KEY),
+  getRefresh: () => sessionStorage.getItem(REFRESH_KEY),
   set: (access: string, refresh: string) => {
-    localStorage.setItem(TOKEN_KEY, access);
-    localStorage.setItem(REFRESH_KEY, refresh);
+    sessionStorage.setItem(TOKEN_KEY, access);
+    sessionStorage.setItem(REFRESH_KEY, refresh);
   },
   clear: () => {
-    localStorage.removeItem(TOKEN_KEY);
-    localStorage.removeItem(REFRESH_KEY);
+    sessionStorage.removeItem(TOKEN_KEY);
+    sessionStorage.removeItem(REFRESH_KEY);
   },
 };
 
 // ── Factory ────────────────────────────────────────────────────────────────
 function createClient(baseURL: string): AxiosInstance {
-  const client = axios.create({ baseURL, timeout: 15_000 });
+  const client = axios.create({ baseURL, timeout: 15_000, withCredentials: true });
 
   client.interceptors.request.use((config: InternalAxiosRequestConfig) => {
     const token = tokenStorage.getAccess();
@@ -34,23 +34,39 @@ function createClient(baseURL: string): AxiosInstance {
       if (error.response?.status === 401 && !original._retry) {
         original._retry = true;
         try {
-          const refresh = tokenStorage.getRefresh();
-          if (!refresh) throw new Error("No refresh token");
-          const { data } = await axios.post(
-            `${DJANGO_URL}/api/v1/auth/token/refresh/`,
-            { refresh }
-          );
+          // Primary: cookie-based refresh (backend reads refresh token from HttpOnly cookie).
+          // Fallback: body-based refresh using sessionStorage for backward compatibility.
+          let refreshed = false;
+          try {
+            const { data } = await axios.post(
+              `${DJANGO_URL}/api/v1/auth/token/refresh/`,
+              {},
+              { withCredentials: true }
+            );
+            const nextAccess = data.access;
+            if (nextAccess) {
+              tokenStorage.set(nextAccess, data.refresh ?? tokenStorage.getRefresh() ?? "");
+              original.headers.Authorization = `Bearer ${nextAccess}`;
+              refreshed = true;
+            }
+          } catch {
+            const refresh = tokenStorage.getRefresh();
+            if (!refresh) throw new Error("No refresh token available");
+            const { data } = await axios.post(
+              `${DJANGO_URL}/api/v1/auth/token/refresh/`,
+              { refresh },
+              { withCredentials: true }
+            );
+            const nextAccess = data.access;
+            if (!nextAccess) throw new Error("Refresh response missing access token");
+            tokenStorage.set(nextAccess, data.refresh ?? refresh);
+            original.headers.Authorization = `Bearer ${nextAccess}`;
+            refreshed = true;
+          }
 
-
-          // Store rotated refresh token if provided by the backend.
-          const nextAccess = data.access;
-          const nextRefresh = data.refresh ?? refresh;
-          if (!nextAccess) throw new Error("Refresh response missing access token");
-
-          tokenStorage.set(nextAccess, nextRefresh);
-          original.headers.Authorization = `Bearer ${nextAccess}`;
-
-          return client(original);
+          if (refreshed) {
+            return client(original);
+          }
         } catch {
           tokenStorage.clear();
           window.location.href = "/login";
@@ -64,8 +80,13 @@ function createClient(baseURL: string): AxiosInstance {
 }
 
 // ── Clients ────────────────────────────────────────────────────────────────
-const DJANGO_URL = "http://127.0.0.1:8000";
-const FASTAPI_URL = "http://127.0.0.1:8001";
+// In Docker/production these come from the VITE_DJANGO_URL / VITE_FASTAPI_URL
+// build args in docker-compose.yml (e.g. "/api/django", "/api/analytics"),
+// which nginx.conf then reverse-proxies to the django/fastapi containers.
+// The relative-path fallbacks match the dev-server proxy rules in vite.config.ts,
+// so `npm run dev` works too.
+const DJANGO_URL = import.meta.env.VITE_DJANGO_URL ?? "/api/django";
+const FASTAPI_URL = import.meta.env.VITE_FASTAPI_URL ?? "/api/analytics";
 
 
 
@@ -77,7 +98,7 @@ export const analyticsAPI = createClient(FASTAPI_URL);
 // ── Auth ───────────────────────────────────────────────────────────────────
 export const authService = {
   login: async (email: string, password: string) => {
-    const { data } = await djangoAPI.post("/api/v1/auth/login/", { email, password });
+    const { data } = await djangoAPI.post("/api/v1/auth/token/", { email, password });
     tokenStorage.set(data.access, data.refresh);
     return data;
   },
@@ -87,26 +108,13 @@ export const authService = {
     return data;
   },
 
-
   register: async (payload: Record<string, unknown>) => {
-    const res = await djangoAPI.post("/api/v1/auth/registration/", {
-      email: payload.email,
-      password1: payload.password,
-      password2: payload.password_confirm,
-      first_name: payload.first_name,
-      last_name: payload.last_name,
-      organization: payload.organization_id || null,
-    });
-    const data = res.data;
-    if (res.status >= 400) {
-      throw new Error(
-        data.email?.[0] ||
-        data.password1?.[0] ||
-        data.non_field_errors?.[0] ||
-        "Registration failed"
-      );
-    }
-    tokenStorage.set(data.access, data.refresh);
+    const mapped = {
+      ...payload,
+      ...(payload.password ? { password1: payload.password } : {}),
+      ...(payload.password_confirm ? { password2: payload.password_confirm } : {}),
+    };
+    const { data } = await djangoAPI.post("/api/v1/auth/register/", mapped);
     return data;
   },
   forgotPassword: async (email: string) => {
@@ -123,11 +131,10 @@ export const authService = {
     return data;
   },
   logout: async () => {
-    // Best-effort server-side logout/blacklist.
     const refresh = tokenStorage.getRefresh();
     try {
       if (refresh) {
-        await djangoAPI.post("/api/v1/auth/logout/", { refresh });
+        await djangoAPI.post("/api/v1/auth/logout/", { refresh }, { withCredentials: true });
       }
     } catch {
       // Ignore network/server errors; still clear local tokens.

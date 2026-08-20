@@ -12,10 +12,26 @@ from fastapi.testclient import TestClient
 
 # ── Shared secret must be set before app import ────────────────────────
 import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "backend"))
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "core.settings")
 os.environ.setdefault("JWT_SIGNING_SECRET", "test-jwt-signing-secret-for-pytest-only")
 os.environ.setdefault("FASTAPI_SERVICE_SECRET", "test-fastapi-service-secret-for-pytest-only")
+os.environ.setdefault("JWT_ISSUER", "test-issuer")
+os.environ.setdefault("JWT_AUDIENCE", "test-audience")
 os.environ.setdefault("INTERNAL_SERVICE_KEY", "test-internal-key")
 os.environ.setdefault("MEDIA_ROOT", "/tmp/test-media")
+
+# Debug path resolution
+if os.environ.get("DEBUG_PATHS"):
+    print("SYS_PATH:")
+    for p in sys.path[:10]:
+        print(f"  {p}")
+    print(f"Looking for: core.settings")
+
+import django
+django.setup()
 
 from main import app  # noqa: E402
 
@@ -37,7 +53,11 @@ def _make_token(role="user", org_id=None, expired=False):
         "email": "test@acme.com",
         "role": role,
         "org_id": org_id or str(uuid4()),
+        "token_type": "access",
+        "iat": now - 10 if expired else now,
         "exp": now - 10 if expired else now + 3600,
+        "iss": os.environ.get("JWT_ISSUER", "datalens-backend"),
+        "aud": os.environ.get("JWT_AUDIENCE", "datalens-api"),
     }
     return jwt.encode(payload, SECRET, algorithm="HS256")
 
@@ -90,6 +110,25 @@ def test_valid_token_passes_auth(client, user_token, tmp_path, monkeypatch):
     assert resp.status_code == 404  # auth passed, dataset not found
 
 
+def test_refresh_token_rejected_by_fastapi(client):
+    now = int(time.time())
+    payload = {
+        "sub": str(uuid4()),
+        "email": "test@acme.com",
+        "role": "user",
+        "org_id": str(uuid4()),
+        "token_type": "refresh",
+        "iat": now,
+        "exp": now + 3600,
+        "iss": os.environ.get("JWT_ISSUER", "datalens-backend"),
+        "aud": os.environ.get("JWT_AUDIENCE", "datalens-api"),
+    }
+    refresh_token = jwt.encode(payload, SECRET, algorithm="HS256")
+    resp = client.get(f"/api/v1/analytics/{uuid4()}", headers=auth(refresh_token))
+    assert resp.status_code == 401
+    assert "access token required" in resp.json()["detail"].lower()
+
+
 # ── Tenant isolation tests ──────────────────────────────────────────────────
 def test_analytics_denies_cross_org_access(client, user_token, tmp_path, monkeypatch):
     import os
@@ -109,7 +148,9 @@ def test_analytics_denies_cross_org_access(client, user_token, tmp_path, monkeyp
     org_a_dir.mkdir()
     org_b_dir.mkdir()
 
-    csv_a = org_a_dir / f"{dataset_id}.csv"
+    # New org-scoped upload path: datasets/{org_id}/{dataset_id}/<filename>
+    csv_a = org_a_dir / dataset_id / "data.csv"
+    csv_a.parent.mkdir(parents=True, exist_ok=True)
     csv_a.write_text("col1,col2\n1,2\n3,4\n")
 
     monkeypatch.setenv("MEDIA_ROOT", str(media_root))
@@ -142,7 +183,9 @@ def test_insights_denies_cross_org_access(client, user_token, tmp_path, monkeypa
     org_a_dir.mkdir()
     org_b_dir.mkdir()
 
-    csv_a = org_a_dir / f"{dataset_id}.csv"
+    # New org-scoped upload path: datasets/{org_id}/{dataset_id}/<filename>
+    csv_a = org_a_dir / dataset_id / "data.csv"
+    csv_a.parent.mkdir(parents=True, exist_ok=True)
     csv_a.write_text("col1,col2\n1,2\n3,4\n")
 
     monkeypatch.setenv("MEDIA_ROOT", str(media_root))
@@ -289,11 +332,12 @@ def test_process_requires_service_key(client, user_token):
     assert resp.status_code in (422, 403)
 
 
-def test_process_with_valid_service_key(client, user_token):
+def test_process_with_valid_service_token(client, user_token):
     dataset_id = uuid4()
+    service_token = _make_service_token()
     resp = client.post(
         f"/api/v1/datasets/{dataset_id}/process",
-        headers={**auth(user_token), "X-Service-Key": LEGACY_SERVICE_KEY},
+        headers={**auth(user_token), "X-Service-Key": service_token},
     )
     assert resp.status_code == 200
     body = resp.json()
@@ -304,9 +348,12 @@ def _make_service_token() -> str:
     now = int(time.time())
     payload = {
         "service_name": "django-backend",
+        "token_type": "service",
         "iat": now,
         "exp": now + 300,
         "nbf": now,
+        "iss": os.environ.get("JWT_ISSUER", "datalens-backend"),
+        "aud": os.environ.get("JWT_AUDIENCE", "datalens-api"),
     }
     return jwt.encode(payload, SERVICE_SECRET, algorithm="HS256")
 
@@ -331,10 +378,21 @@ def test_process_with_wrong_service_key_fails(client, user_token):
     assert resp.status_code in (401, 403)
 
 
-# ── Path traversal tests ────────────────────────────────────────────────────
+# ── Data loader security tests ─────────────────────────────────────────
+from apps.datasets.models import Dataset as RealDataset
+
+
+def _make_mock_dataset(file_path, org_id):
+    mock = type("MockDataset", (), {})()
+    mock.organization_id = org_id
+    mock.file = type("MockFile", (), {"path": str(file_path)})()
+    return mock
+
+
 def test_data_loader_prevents_path_traversal(tmp_path, monkeypatch):
     import os
     from services.data_loader import load_dataset
+    from unittest.mock import patch
 
     media_root = tmp_path / "media"
     media_root.mkdir()
@@ -342,20 +400,28 @@ def test_data_loader_prevents_path_traversal(tmp_path, monkeypatch):
     datasets_dir.mkdir()
 
     org_id = str(uuid4())
+    dataset_id = str(uuid4())
     org_dir = datasets_dir / org_id
     org_dir.mkdir()
 
-    safe_csv = org_dir / "safe-dataset.csv"
+    safe_csv = org_dir / dataset_id / "data.csv"
+    safe_csv.parent.mkdir(parents=True, exist_ok=True)
     safe_csv.write_text("col1,col2\n1,2\n3,4\n")
 
     monkeypatch.setenv("MEDIA_ROOT", str(media_root))
 
-    df = load_dataset("safe-dataset", org_id)
-    assert len(df) == 2
+    with patch("apps.datasets.models.Dataset") as MockDataset:
+        MockDataset.DoesNotExist = RealDataset.DoesNotExist
+        MockDataset.objects.select_related.return_value.get.return_value = _make_mock_dataset(
+            safe_csv, org_id
+        )
+        df = load_dataset(dataset_id, org_id)
+        assert len(df) == 2
 
 
 def test_data_loader_blocks_other_org(tmp_path, monkeypatch):
     from services.data_loader import load_dataset
+    from unittest.mock import patch
 
     media_root = tmp_path / "media"
     media_root.mkdir()
@@ -364,17 +430,137 @@ def test_data_loader_blocks_other_org(tmp_path, monkeypatch):
 
     org_a = str(uuid4())
     org_b = str(uuid4())
+    dataset_id = str(uuid4())
+
     org_a_dir = datasets_dir / org_a
     org_b_dir = datasets_dir / org_b
     org_a_dir.mkdir()
     org_b_dir.mkdir()
 
-    csv_a = org_a_dir / "dataset.csv"
-    csv_b = org_b_dir / "dataset.csv"
+    csv_a = org_a_dir / dataset_id / "data.csv"
+    csv_a.parent.mkdir(parents=True, exist_ok=True)
     csv_a.write_text("col1,col2\n1,2\n")
+    csv_b = org_b_dir / dataset_id / "data.csv"
+    csv_b.parent.mkdir(parents=True, exist_ok=True)
     csv_b.write_text("col1,col2\n3,4\n")
 
     monkeypatch.setenv("MEDIA_ROOT", str(media_root))
 
-    with pytest.raises(FileNotFoundError):
-        load_dataset("nonexistent-dataset", org_b)
+    with patch("apps.datasets.models.Dataset") as MockDataset:
+        MockDataset.DoesNotExist = RealDataset.DoesNotExist
+        MockDataset.objects.select_related.return_value.get.return_value = _make_mock_dataset(
+            csv_b, org_b
+        )
+        with pytest.raises(ValueError, match="does not belong"):
+            load_dataset(dataset_id, org_a)
+
+
+def test_data_loader_rejects_path_outside_media_root(tmp_path, monkeypatch):
+    from services.data_loader import load_dataset
+    from unittest.mock import patch
+
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+
+    outside_file = tmp_path / "secret.txt"
+    outside_file.write_text("col1,col2\n1,2\n")
+
+    monkeypatch.setenv("MEDIA_ROOT", str(media_root))
+
+    org_id = str(uuid4())
+    dataset_id = str(uuid4())
+
+    with patch("apps.datasets.models.Dataset") as MockDataset:
+        MockDataset.DoesNotExist = RealDataset.DoesNotExist
+        MockDataset.objects.select_related.return_value.get.return_value = _make_mock_dataset(
+            outside_file, org_id
+        )
+        with pytest.raises(ValueError, match="outside the allowed storage"):
+            load_dataset(dataset_id, org_id)
+
+
+def test_data_loader_rejects_empty_dataset(tmp_path, monkeypatch):
+    from services.data_loader import load_dataset
+    from unittest.mock import patch
+
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    datasets_dir = media_root / "datasets"
+    datasets_dir.mkdir()
+
+    org_id = str(uuid4())
+    dataset_id = str(uuid4())
+    org_dir = datasets_dir / org_id
+    org_dir.mkdir()
+
+    empty_csv = org_dir / dataset_id / "data.csv"
+    empty_csv.parent.mkdir(parents=True, exist_ok=True)
+    empty_csv.write_text("col1,col2\n")
+
+    monkeypatch.setenv("MEDIA_ROOT", str(media_root))
+
+    with patch("apps.datasets.models.Dataset") as MockDataset:
+        MockDataset.DoesNotExist = RealDataset.DoesNotExist
+        MockDataset.objects.select_related.return_value.get.return_value = _make_mock_dataset(
+            empty_csv, org_id
+        )
+        with pytest.raises(ValueError, match="empty"):
+            load_dataset(dataset_id, org_id)
+
+
+def test_data_loader_rejects_malformed_csv(tmp_path, monkeypatch):
+    from services.data_loader import load_dataset
+    from unittest.mock import patch
+
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    datasets_dir = media_root / "datasets"
+    datasets_dir.mkdir()
+
+    org_id = str(uuid4())
+    dataset_id = str(uuid4())
+    org_dir = datasets_dir / org_id
+    org_dir.mkdir()
+
+    bad_csv = org_dir / dataset_id / "data.csv"
+    bad_csv.parent.mkdir(parents=True, exist_ok=True)
+    bad_csv.write_text('col1,col2\n"unclosed quote\n1,2\n')
+
+    monkeypatch.setenv("MEDIA_ROOT", str(media_root))
+
+    with patch("apps.datasets.models.Dataset") as MockDataset:
+        MockDataset.DoesNotExist = RealDataset.DoesNotExist
+        MockDataset.objects.select_related.return_value.get.return_value = _make_mock_dataset(
+            bad_csv, org_id
+        )
+        with pytest.raises(ValueError, match="Malformed"):
+            load_dataset(dataset_id, org_id)
+
+
+def test_data_loader_rejects_oversized_file(tmp_path, monkeypatch):
+    from services.data_loader import load_dataset
+    from unittest.mock import patch
+
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    datasets_dir = media_root / "datasets"
+    datasets_dir.mkdir()
+
+    org_id = str(uuid4())
+    dataset_id = str(uuid4())
+    org_dir = datasets_dir / org_id
+    org_dir.mkdir()
+
+    big_csv = org_dir / dataset_id / "data.csv"
+    big_csv.parent.mkdir(parents=True, exist_ok=True)
+    big_csv.write_bytes(b"x" * (10 * 1024 * 1024 + 1))
+
+    monkeypatch.setenv("MEDIA_ROOT", str(media_root))
+
+    with patch("apps.datasets.models.Dataset") as MockDataset:
+        MockDataset.DoesNotExist = RealDataset.DoesNotExist
+        MockDataset.objects.select_related.return_value.get.return_value = _make_mock_dataset(
+            big_csv, org_id
+        )
+        with pytest.raises(ValueError, match="exceeds maximum"):
+            load_dataset(dataset_id, org_id)

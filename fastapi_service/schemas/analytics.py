@@ -9,6 +9,7 @@ class TokenClaims(BaseModel):
     role: str
     org_id: Optional[str] = None
     exp: int
+    token_type: str = "access"
 
 
 class MetricResult(BaseModel):

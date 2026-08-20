@@ -1,4 +1,5 @@
 from django.contrib import admin
+from django.http import JsonResponse
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 
@@ -14,12 +15,18 @@ from apps.users.logout import LogoutView
 from apps.organizations.views import OrganizationViewSet
 from apps.datasets.views import DatasetViewSet
 
+
+def health_check(request):
+    return JsonResponse({"status": "ok", "service": "django"})
+
+
 router = DefaultRouter()
 router.register("users", UserViewSet, basename="user")
 router.register("organizations", OrganizationViewSet, basename="organization")
 router.register("datasets", DatasetViewSet, basename="dataset")
 
 urlpatterns = [
+    path("health/", health_check, name="health_check"),
     path("admin/", admin.site.urls),
     path("api/v1/", include(router.urls)),
     # Custom login with rate limiting (must come before dj_rest_auth to take precedence)
