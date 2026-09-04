@@ -117,16 +117,18 @@ def require_org_member(claims: TokenClaims = Depends(get_current_user)) -> Token
 def _make_service_token() -> str:
     """Generate a short-lived internal JWT for service-to-service auth."""
     import time
+    import uuid
 
     now = int(time.time())
     payload = {
-        "service_name": "django-backend",
+        "sub": "django-backend",
+        "jti": str(uuid.uuid4()),
         "token_type": "service",
         "iat": now,
         "exp": now + SERVICE_TOKEN_LIFETIME_SECONDS,
         "nbf": now,
         "iss": JWT_ISSUER,
-        "aud": JWT_AUDIENCE,
+        "aud": "fastapi-service",
     }
     return jwt.encode(payload, FASTAPI_SERVICE_SECRET, algorithm=JWT_ALGORITHM)
 
@@ -143,8 +145,8 @@ def verify_service_key(x_service_key: Optional[str] = None) -> bool:
         )
 
     try:
-        payload = jwt.decode(x_service_key, FASTAPI_SERVICE_SECRET, algorithms=[JWT_ALGORITHM])
-        if payload.get("service_name") != "django-backend":
+        payload = jwt.decode(x_service_key, FASTAPI_SERVICE_SECRET, algorithms=[JWT_ALGORITHM], audience="fastapi-service", issuer=JWT_ISSUER, options={"require": ["exp", "iat", "sub", "jti"]})
+        if payload.get("sub") != "django-backend":
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Invalid service token.",

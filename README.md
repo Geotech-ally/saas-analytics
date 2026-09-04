@@ -11,7 +11,7 @@ A production-ready, multi-tenant SaaS analytics system built with Django, FastAP
 │                     Browser (React)                     │
 │   Auth & CRUD → Django        Analytics → FastAPI       │
 └────────────┬───────────────────────────┬────────────────┘
-             │ JWT                        │ JWT (same secret)
+             │ JWT                        │ JWT (dedicated signing secret)
              ▼                           ▼
 ┌────────────────────┐      ┌────────────────────────────┐
 │   Django (DRF)     │      │   FastAPI (Analytics)      │
@@ -49,8 +49,8 @@ A production-ready, multi-tenant SaaS analytics system built with Django, FastAP
 |---|---|
 | Authentication | Django SimpleJWT — signed HS256 tokens |
 | Claims in token | `email`, `role`, `org_id` embedded at issue time |
-| FastAPI validation | PyJWT decodes using shared `DJANGO_SECRET_KEY` |
-| Inter-service auth | `X-Service-Key` header on internal endpoints |
+| FastAPI validation | PyJWT decodes with dedicated `JWT_SIGNING_SECRET`, never `DJANGO_SECRET_KEY` |
+| Inter-service auth | Short-lived signed `X-Service-Key` service JWT (issuer, subject, audience, jti, expiry) |
 | Tenant isolation | All queries filtered by `organization_id` |
 | RBAC | `IsOrganizationAdmin` / `IsOrganizationMember` permission classes |
 
@@ -64,7 +64,7 @@ A production-ready, multi-tenant SaaS analytics system built with Django, FastAP
 git clone <repo>
 cd saas-analytics
 cp .env.example .env
-# Edit .env — set strong values for DJANGO_SECRET_KEY, POSTGRES_PASSWORD, INTERNAL_SERVICE_KEY
+# Edit .env — set distinct strong values for DJANGO_SECRET_KEY, JWT_SIGNING_SECRET, and FASTAPI_SERVICE_SECRET.
 ```
 
 ### 2. Generate secrets
@@ -192,3 +192,18 @@ saas-analytics/
 - **Media**: Replace shared Docker volume with S3 in production — update `data_loader.py` to use `boto3`
 - **Processing**: Replace `trigger_processing` sync call with Celery + Redis for true async dataset processing
 - **Caching**: Add Redis cache layer in FastAPI for repeated analytics calls on the same dataset
+
+## Operations
+
+Dataset uploads create an organization-scoped processing job and return immediately. Run the Django API, a Celery worker, and Celery Beat together; Beat dispatches the Saturday job, which generates exactly one immutable report for each organization for the previous completed Monday–Sunday period. Delivery records make email retry-safe.
+
+Useful worktree recovery commands:
+
+```bash
+git worktree list
+git worktree add ../feature/name -b feature/name
+git worktree remove ../feature/name
+git worktree prune
+```
+
+For an abandoned worktree, confirm it is no longer needed, remove it with `git worktree remove`, then run `git worktree prune`. Resolve merge conflicts in the affected worktree, stage the resolution, and continue the rebase; never delete a worktree directory manually.

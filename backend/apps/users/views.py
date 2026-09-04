@@ -48,6 +48,15 @@ class CustomTokenObtainPairView(TokenObtainPairView):
     serializer_class = CustomTokenObtainPairSerializer
     throttle_classes = [LoginAnonThrottle, LoginBlockThrottle]
 
+    def post(self, request, *args, **kwargs):
+        response = super().post(request, *args, **kwargs)
+        if response.status_code == status.HTTP_200_OK:
+            user = User.objects.filter(email__iexact=request.data.get("email", "")).select_related("organization").first()
+            if user and user.organization_id:
+                from apps.datasets.models import AnalyticsEvent
+                AnalyticsEvent.objects.create(organization=user.organization, user=user, event_type="user_login", metadata={})
+        return response
+
 
 class UserViewSet(ModelViewSet):
     queryset = User.objects.select_related("organization").all()
@@ -230,7 +239,7 @@ class ResetPasswordView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if token_is_expired(reset_record.created_at):
+        if timezone.now() > reset_record.expires_at:
             reset_record.delete()
             return Response(
                 {"detail": "This token has expired."},
@@ -242,6 +251,13 @@ class ResetPasswordView(APIView):
 
         reset_record.used = True
         reset_record.save(update_fields=["used"])
+        # Password changes invalidate every outstanding refresh token for this user.
+        try:
+            from rest_framework_simplejwt.token_blacklist.models import OutstandingToken, BlacklistedToken
+            for outstanding in OutstandingToken.objects.filter(user=user):
+                BlacklistedToken.objects.get_or_create(token=outstanding)
+        except Exception:
+            logger.warning("Could not blacklist outstanding tokens after password reset for user=%s", user.pk)
 
         from django.contrib.sessions.models import Session
         Session.objects.filter(session_data__contains=user_id).delete()

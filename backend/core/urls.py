@@ -13,7 +13,7 @@ from apps.users.views_social import SocialTokenExchangeView
 from apps.users.logout import LogoutView
 
 from apps.organizations.views import OrganizationViewSet
-from apps.datasets.views import DatasetViewSet
+from apps.datasets.views import DatasetViewSet, WeeklyReportViewSet, LiveAnalyticsView
 
 
 def health_check(request):
@@ -24,11 +24,13 @@ router = DefaultRouter()
 router.register("users", UserViewSet, basename="user")
 router.register("organizations", OrganizationViewSet, basename="organization")
 router.register("datasets", DatasetViewSet, basename="dataset")
+router.register("weekly-reports", WeeklyReportViewSet, basename="weekly-report")
 
 urlpatterns = [
     path("health/", health_check, name="health_check"),
     path("admin/", admin.site.urls),
     path("api/v1/", include(router.urls)),
+    path("api/v1/analytics/live/", LiveAnalyticsView.as_view(), name="live-analytics"),
     # Custom login with rate limiting (must come before dj_rest_auth to take precedence)
     path("api/v1/auth/token/", CustomTokenObtainPairView.as_view(), name="token_obtain"),
     # Custom endpoints (must come before dj_rest_auth to take precedence)

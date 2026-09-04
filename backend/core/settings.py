@@ -50,12 +50,22 @@ else:
 # ─────────────────────────────────────────────────────────────
 # JWT / Secrets
 # ─────────────────────────────────────────────────────────────
-JWT_SIGNING_SECRET = os.getenv("JWT_SIGNING_SECRET", SECRET_KEY)
-FASTAPI_SERVICE_SECRET = os.getenv(
-    "FASTAPI_SERVICE_SECRET", secrets.token_urlsafe(32)
-)
+# JWT material is deliberately independent of Django's session/CSRF secret.
+# Development gets ephemeral values so a missing local .env never causes a
+# developer to accidentally share DJANGO_SECRET_KEY with another service.
+JWT_SIGNING_SECRET = os.getenv("JWT_SIGNING_SECRET") or secrets.token_urlsafe(64)
+FASTAPI_SERVICE_SECRET = os.getenv("FASTAPI_SERVICE_SECRET") or secrets.token_urlsafe(32)
+if DJANGO_ENV == "production" and (
+    not os.getenv("DJANGO_SECRET_KEY") or not os.getenv("JWT_SIGNING_SECRET")
+    or not os.getenv("FASTAPI_SERVICE_SECRET") or JWT_SIGNING_SECRET == SECRET_KEY
+):
+    raise RuntimeError("Production requires distinct DJANGO_SECRET_KEY, JWT_SIGNING_SECRET, and FASTAPI_SERVICE_SECRET.")
 JWT_ISSUER = os.getenv("JWT_ISSUER", "datalens-backend")
 JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "datalens-api")
+SERVICE_TOKEN_LIFETIME_SECONDS = int(os.getenv("SERVICE_TOKEN_LIFETIME_SECONDS", "300"))
+WEEKLY_REPORT_TIMEZONE = os.getenv("ANALYTICS_TIMEZONE", "UTC")
+WEEKLY_REPORT_HOUR = int(os.getenv("WEEKLY_REPORT_HOUR", "8"))
+MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", str(10 * 1024 * 1024)))
 
 # ─────────────────────────────────────────────────────────────
 # Applications
@@ -263,7 +273,7 @@ from celery.schedules import crontab
 CELERY_BEAT_SCHEDULE = {
     "weekly-analytics-report": {
         "task": "apps.datasets.tasks.send_weekly_analytics_report",
-        "schedule": crontab(minute=0, hour=8, day_of_week="sat"),
+        "schedule": crontab(minute=0, hour=WEEKLY_REPORT_HOUR, day_of_week="sat"),
         "args": (),
     },
 }

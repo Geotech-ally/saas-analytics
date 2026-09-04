@@ -34,17 +34,18 @@ class DatasetSerializer(serializers.ModelSerializer):
         model = Dataset
         fields = [
             "id", "name", "description", "file", "file_size",
-            "row_count", "column_count", "status", "error_message",
+            "row_count", "column_count", "status", "error_message", "analysis_results",
             "uploaded_by_email", "created_at", "updated_at",
         ]
         read_only_fields = [
             "id", "file_size", "row_count", "column_count",
-            "status", "error_message", "uploaded_by_email",
+            "status", "error_message", "analysis_results", "uploaded_by_email",
             "created_at", "updated_at",
         ]
 
     def validate_file(self, value):
-        max_size = 10 * 1024 * 1024  # 10 MB
+        from django.conf import settings
+        max_size = settings.MAX_UPLOAD_SIZE
         allowed_types = [
             "text/csv",
             "application/vnd.ms-excel",
@@ -56,11 +57,11 @@ class DatasetSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("File size must not exceed 10 MB.")
         if value.content_type not in allowed_types:
             raise serializers.ValidationError(
-                "Unsupported file type. Use CSV or Excel (.csv, .xlsx, .xls)."
+                "Unsupported file type. Use CSV, Excel, or JSON."
             )
         filename = _sanitize_filename(value.name)
         ext = os.path.splitext(filename)[1].lower()
-        allowed_extensions = [".csv", ".xlsx", ".xls"]
+        allowed_extensions = [".csv", ".xlsx", ".xls", ".json"]
         if ext not in allowed_extensions:
             raise serializers.ValidationError(
                 f"Unsupported file extension '{ext}'. Allowed: {', '.join(allowed_extensions)}"

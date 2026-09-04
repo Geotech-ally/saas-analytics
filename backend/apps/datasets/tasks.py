@@ -1,139 +1,82 @@
+"""Tenant-scoped, retryable background work."""
 import logging
 from datetime import datetime, timedelta
-
+from zoneinfo import ZoneInfo
 from celery import shared_task
 from django.conf import settings
-from django.core.mail import send_mail
-from django.db.models import Count, Sum, Avg, Max, Min
+from django.core.mail import EmailMultiAlternatives
+from django.db.models import Count
 from django.utils import timezone
-
-from .models import Dataset
+from .models import AnalyticsEvent, Dataset, DatasetProcessingJob, WeeklyReport, WeeklyReportDelivery
 
 logger = logging.getLogger(__name__)
 
+def _summary(dataset):
+    import pandas as pd
+    ext = dataset.file.name.rsplit('.', 1)[-1].lower()
+    if ext == 'csv': frame = pd.read_csv(dataset.file.path, nrows=500000)
+    elif ext in {'xls', 'xlsx'}: frame = pd.read_excel(dataset.file.path, nrows=500000)
+    elif ext == 'json': frame = pd.read_json(dataset.file.path).head(500000)
+    else: raise ValueError('Unsupported dataset format')
+    if frame.empty: raise ValueError('Dataset is empty')
+    columns = [{"name": str(name), "dtype": str(frame[name].dtype), "missing": int(frame[name].isna().sum()), "unique": int(frame[name].nunique())} for name in frame.columns]
+    return len(frame), len(frame.columns), {"columns": columns, "duplicate_rows": int(frame.duplicated().sum())}
 
-@shared_task(bind=True, max_retries=3, default_retry_delay=30)
-def process_dataset_async(self, dataset_id):
-    """Background task to process an uploaded dataset through FastAPI."""
+@shared_task(bind=True, max_retries=3)
+def process_dataset_async(self, job_id):
+    try: job = DatasetProcessingJob.objects.select_related('dataset', 'organization', 'dataset__uploaded_by').get(id=job_id)
+    except DatasetProcessingJob.DoesNotExist: return
+    if job.status == DatasetProcessingJob.Status.COMPLETED: return {"job_id": str(job.id), "status": job.status}
+    dataset = job.dataset
+    job.status, job.progress, job.started_at = DatasetProcessingJob.Status.PROCESSING, 10, job.started_at or timezone.now()
+    job.save(update_fields=['status', 'progress', 'started_at'])
+    dataset.status = Dataset.Status.PROCESSING; dataset.save(update_fields=['status', 'updated_at'])
     try:
-        dataset = Dataset.objects.get(id=dataset_id)
-    except Dataset.DoesNotExist:
-        logger.warning("Dataset %s not found, skipping processing.", dataset_id)
-        return
-
-    if dataset.organization_id is None:
-        logger.error(
-            "Dataset %s has no organization; cannot process.", dataset_id
-        )
-        dataset.status = Dataset.Status.FAILED
-        dataset.error_message = "Dataset has no organization assigned."
-        dataset.save(update_fields=["status", "error_message"])
-        return
-
-    if dataset.uploaded_by is None:
-        logger.error(
-            "Dataset %s has no uploaded_by user; cannot process.", dataset_id
-        )
-        dataset.status = Dataset.Status.FAILED
-        dataset.error_message = "Dataset has no uploaded user."
-        dataset.save(update_fields=["status", "error_message"])
-        return
-
-    dataset.status = Dataset.Status.PROCESSING
-    dataset.save(update_fields=["status"])
-
-    try:
-        from core.fastapi_client import FastAPIClient
-
-        client = FastAPIClient(user=dataset.uploaded_by)
-        response = client.trigger_processing(dataset_id=str(dataset.id))
-        logger.info(
-            "FastAPI triggered processing for dataset %s: %s", dataset_id, response
-        )
+        rows, cols, results = _summary(dataset)
+        dataset.row_count, dataset.column_count, dataset.analysis_results, dataset.status, dataset.error_message = rows, cols, results, Dataset.Status.READY, ''
+        dataset.save(update_fields=['row_count', 'column_count', 'analysis_results', 'status', 'error_message', 'updated_at'])
+        job.status, job.progress, job.completed_at = DatasetProcessingJob.Status.COMPLETED, 100, timezone.now()
+        job.save(update_fields=['status', 'progress', 'completed_at'])
+        AnalyticsEvent.objects.create(organization=job.organization, user=dataset.uploaded_by, event_type='dataset_processing_completed', metadata={'dataset_id': str(dataset.id), 'job_id': str(job.id)})
+        return {"job_id": str(job.id), "status": job.status}
     except Exception as exc:
-        logger.error(
-            "FastAPI processing trigger failed for dataset %s: %s", dataset_id, exc
-        )
-        dataset.status = Dataset.Status.FAILED
-        dataset.error_message = str(exc)
-        dataset.save(update_fields=["status", "error_message"])
-        raise self.retry(exc=exc)
+        logger.warning('Dataset processing failed job=%s: %s', job.id, type(exc).__name__)
+        if self.request.retries < self.max_retries: raise self.retry(exc=exc, countdown=30 * (2 ** self.request.retries))
+        dataset.status, dataset.error_message = Dataset.Status.FAILED, 'Processing failed.'; dataset.save(update_fields=['status', 'error_message', 'updated_at'])
+        job.status, job.error_message, job.completed_at = DatasetProcessingJob.Status.FAILED, 'Processing failed.', timezone.now(); job.save(update_fields=['status', 'error_message', 'completed_at'])
+        raise
 
+def previous_complete_week(now=None):
+    local = (now or timezone.now()).astimezone(ZoneInfo(settings.WEEKLY_REPORT_TIMEZONE))
+    end = (local - timedelta(days=local.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    return end - timedelta(days=7), end
 
-@shared_task
-def generate_analytics_async(dataset_id):
-    """Background task to generate analytics for a processed dataset."""
-    try:
-        dataset = Dataset.objects.get(id=dataset_id)
-    except Dataset.DoesNotExist:
-        logger.warning("Dataset %s not found for analytics.", dataset_id)
-        return
+def _metrics(org, start, end):
+    events = AnalyticsEvent.objects.filter(organization=org, created_at__gte=start, created_at__lt=end); datasets = Dataset.objects.filter(organization=org, created_at__gte=start, created_at__lt=end)
+    return {'active_users': events.exclude(user__isnull=True).values('user_id').distinct().count(), 'events': events.count(), 'datasets_uploaded': datasets.count(), 'datasets_completed': datasets.filter(status=Dataset.Status.READY).count(), 'datasets_failed': datasets.filter(status=Dataset.Status.FAILED).count(), 'top_features': list(events.values('event_type').annotate(count=Count('id')).order_by('-count')[:5])}
 
-    logger.info("Analytics generation started for dataset %s", dataset_id)
-    return {"dataset_id": str(dataset_id), "status": "analytics_queue"}
-
+@shared_task(bind=True, max_retries=3)
+def generate_weekly_report(self, organization_id, period_start=None, period_end=None):
+    from apps.organizations.models import Organization
+    org = Organization.objects.get(id=organization_id, is_active=True); start, end = previous_complete_week() if not period_start else (datetime.fromisoformat(period_start), datetime.fromisoformat(period_end))
+    report, _ = WeeklyReport.objects.get_or_create(organization=org, period_start=start, period_end=end)
+    if report.status == WeeklyReport.Status.COMPLETED: return str(report.id)
+    report.report_data = {'metrics': _metrics(org, start, end), 'previous_period': _metrics(org, start - (end-start), start), 'period_start': start.isoformat(), 'period_end': end.isoformat()}; report.status, report.generated_at = WeeklyReport.Status.COMPLETED, timezone.now(); report.save(update_fields=['report_data', 'status', 'generated_at']); send_weekly_report_email.delay(str(report.id)); return str(report.id)
 
 @shared_task
 def send_weekly_analytics_report():
-    """Send weekly analytics report to all active users."""
+    from apps.organizations.models import Organization
+    start, end = previous_complete_week()
+    for org_id in Organization.objects.filter(is_active=True).values_list('id', flat=True): generate_weekly_report.delay(str(org_id), start.isoformat(), end.isoformat())
+
+@shared_task(bind=True, max_retries=3)
+def send_weekly_report_email(self, report_id):
     from apps.users.models import User
-    from django.db.models import Q
-
-    now = timezone.now()
-    week_start = now - timedelta(days=7)
-
-    active_users = User.objects.filter(
-        is_active=True,
-        organization__isnull=False,
-        organization__is_active=True,
-    ).select_related("organization")
-
-    sent_count = 0
-    failed_count = 0
-
-    for user in active_users:
+    report = WeeklyReport.objects.select_related('organization').get(id=report_id, status=WeeklyReport.Status.COMPLETED)
+    for email in User.objects.filter(organization=report.organization, is_active=True, role=User.Role.ADMIN).values_list('email', flat=True):
+        delivery, _ = WeeklyReportDelivery.objects.get_or_create(report=report, recipient=email)
+        if delivery.status == WeeklyReportDelivery.Status.SENT: continue
         try:
-            org_datasets = Dataset.objects.filter(
-                organization=user.organization,
-                created_at__gte=week_start,
-            )
-            total_datasets = org_datasets.count()
-            ready_datasets = org_datasets.filter(status=Dataset.Status.READY).count()
-            processing_datasets = org_datasets.filter(status=Dataset.Status.PROCESSING).count()
-            failed_datasets = org_datasets.filter(status=Dataset.Status.FAILED).count()
-            total_size = sum(d.file_size for d in org_datasets) / (1024 * 1024)
-
-            subject = f"DataLens Weekly Report — {user.organization.name}"
-            message = f"""Hello {user.full_name},
-
-Here is your weekly analytics report for {user.organization.name}:
-
-Week: {week_start.strftime('%Y-%m-%d')} to {now.strftime('%Y-%m-%d')}
-
-Summary:
-- Total datasets uploaded: {total_datasets}
-- Ready for analysis: {ready_datasets}
-- Currently processing: {processing_datasets}
-- Failed: {failed_datasets}
-- Total storage used: {total_size:.2f} MB
-
-Log in to your dashboard for detailed analytics.
-
-Best regards,
-DataLens Team"""
-
-            send_mail(
-                subject,
-                message,
-                getattr(settings, "DEFAULT_FROM_EMAIL", "noreply@datalens.com"),
-                [user.email],
-                fail_silently=False,
-            )
-            logger.info("Weekly report sent to %s", user.email)
-            sent_count += 1
+            message = EmailMultiAlternatives(f'DataLens Weekly Report — {report.organization.name}', 'Your weekly analytics report is ready.', settings.DEFAULT_FROM_EMAIL, [email]); message.attach_alternative('<h1>Weekly Analytics Report</h1><p>Your dashboard contains the full report.</p>', 'text/html'); message.send(); delivery.status, delivery.sent_at, delivery.error_message = WeeklyReportDelivery.Status.SENT, timezone.now(), ''; delivery.save(update_fields=['status', 'sent_at', 'error_message'])
         except Exception as exc:
-            logger.error("Failed to send weekly report to %s: %s", user.email, exc)
-            failed_count += 1
-
-    logger.info("Weekly analytics report task completed: sent=%d failed=%d", sent_count, failed_count)
-    return {"sent": sent_count, "failed": failed_count}
+            delivery.status, delivery.error_message = WeeklyReportDelivery.Status.FAILED, 'Email delivery failed.'; delivery.save(update_fields=['status', 'error_message']); raise self.retry(exc=exc, countdown=60 * (2 ** self.request.retries))

@@ -5,6 +5,7 @@ service-to-service authentication.
 """
 import logging
 import time
+import uuid
 from typing import Any, Dict
 
 import jwt
@@ -27,7 +28,10 @@ class FastAPIClientError(Exception):
 def _make_service_token() -> str:
     now = int(time.time())
     payload = {
-        "service_name": "django-backend",
+        "iss": settings.JWT_ISSUER,
+        "sub": "django-backend",
+        "aud": "fastapi-service",
+        "jti": str(uuid.uuid4()),
         "token_type": "service",
         "iat": now,
         "exp": now + SERVICE_TOKEN_LIFETIME,

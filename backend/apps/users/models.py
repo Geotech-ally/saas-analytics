@@ -24,6 +24,7 @@ class UserManager(BaseUserManager):
 class User(AbstractBaseUser, PermissionsMixin):
     class Role(models.TextChoices):
         ADMIN = "admin", "Admin"
+        DATA_ANALYST = "data_analyst", "Data Analyst"
         USER = "user", "User"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
